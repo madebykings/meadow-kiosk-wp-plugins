@@ -234,34 +234,35 @@ function meadow_admin_tools_render_metabox($post) {
 
     echo '<hr style="margin:12px 0;" />';
 
-    $enter_url = esc_js(rest_url('meadow/v1/admin/kiosk-enter'));
-$exit_url  = esc_js(rest_url('meadow/v1/admin/kiosk-exit'));
-$nonce     = esc_js(wp_create_nonce('wp_rest'));
-$post_id_js = (int)$post->ID;
+$pi_control_url = esc_js( rest_url('meadow/v1/admin/pi/control') );
+$nonce          = esc_js( wp_create_nonce('wp_rest') );
+$post_id_js     = (int) $post->ID;
 
 echo "<script>
 (() => {
   const out = document.getElementById('meadowKioskCtlOut');
   const postId = {$post_id_js};
+  const url = '{$pi_control_url}';
 
-  async function call(url){
-    out.textContent = 'Sending...\\n';
+  async function call(action){
+    out.textContent = 'Sending ' + action + '...\\n';
     const r = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-WP-Nonce': '{$nonce}'
       },
-      body: JSON.stringify({ kiosk_post_id: postId })
+      body: JSON.stringify({ kiosk_post_id: postId, action })
     });
     const j = await r.json().catch(() => ({}));
     out.textContent = 'HTTP ' + r.status + '\\n' + JSON.stringify(j, null, 2);
   }
 
-  document.getElementById('meadowEnterKiosk')?.addEventListener('click', () => call('{$enter_url}'));
-  document.getElementById('meadowExitKiosk')?.addEventListener('click',  () => call('{$exit_url}'));
+  document.getElementById('meadowEnterKiosk')?.addEventListener('click', () => call('enter_kiosk'));
+  document.getElementById('meadowExitKiosk')?.addEventListener('click',  () => call('exit_kiosk'));
 })();
 </script>";
+
 
 
     // Motors from repeater
@@ -291,3 +292,4 @@ echo "<script>
         }
     }
 }
+
