@@ -14,6 +14,7 @@ define('MEADOW_KIOSK_CORE_URL', plugin_dir_url(__FILE__));
 require_once MEADOW_KIOSK_CORE_PATH . 'includes/helpers.php';
 require_once MEADOW_KIOSK_CORE_PATH . 'includes/class-meadow-kiosk-core.php';
 require_once MEADOW_KIOSK_CORE_PATH . 'includes/shortcodes.php';
+require_once __DIR__ . '/includes/order-cleanup.php';
 
 function meadow_kiosk_core_boot() {
     $GLOBALS['meadow_kiosk_core'] = new Meadow_Kiosk_Core();
