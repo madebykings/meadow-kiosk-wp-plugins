@@ -99,33 +99,51 @@ add_action('rest_api_init', function () {
 
     // Keep screen reset here (separate from Core)
     register_rest_route('meadow/v1', '/admin/screen-reset', [
-        'methods'             => 'POST',
-        'permission_callback' => function (WP_REST_Request $req) {
-            return is_user_logged_in() && current_user_can('edit_posts');
-        },
-        'callback'            => function (WP_REST_Request $req) {
-            if (function_exists('meadow_kiosk_nocache_headers')) meadow_kiosk_nocache_headers();
+    'methods'  => 'POST',
 
-            $data = (array) $req->get_json_params();
-            $post_id = (int) ($data['kiosk_post_id'] ?? 0);
+    // Allow: admins OR venue users (logged in)
+    'permission_callback' => function (WP_REST_Request $req) {
+        if ( ! is_user_logged_in() ) return false;
 
-            $mode = isset($data['mode']) ? strtolower(trim((string) $data['mode'])) : 'ads';
-            $allowed = ['ads','browse','payment','paid','vending','thankyou','error','payment_failed'];
-            if ( ! in_array($mode, $allowed, true) ) $mode = 'ads';
+        $u = wp_get_current_user();
+        $is_admin = user_can($u, 'manage_options');
+        $is_venue = in_array('venue', (array) $u->roles, true);
 
-            if ( ! $post_id || get_post_type($post_id) !== 'kiosk' ) {
-                return new WP_Error('bad_request','Missing kiosk_post_id',[ 'status'=>400 ]);
-            }
-            if ( ! current_user_can('edit_post', $post_id) ) {
-                return new WP_Error('forbidden','Not allowed',[ 'status'=>403 ]);
-            }
+        return $is_admin || $is_venue;
+    },
 
-            update_post_meta($post_id, '_meadow_screen_mode', $mode);
-            delete_post_meta($post_id, '_meadow_screen_order_id');
+    'callback' => function (WP_REST_Request $req) {
+        if ( function_exists('meadow_kiosk_nocache_headers') ) meadow_kiosk_nocache_headers();
 
-            return [ 'ok'=>true, 'mode'=>$mode ];
+        $user = wp_get_current_user();
+        $is_admin = user_can($user, 'manage_options');
+
+        $data    = (array) $req->get_json_params();
+        $post_id = (int) ( $data['kiosk_post_id'] ?? 0 );
+
+        $mode    = isset($data['mode']) ? strtolower(trim((string) $data['mode'])) : 'ads';
+        $allowed = ['ads','browse','payment','paid','vending','thankyou','error','payment_failed'];
+        if ( ! in_array($mode, $allowed, true) ) $mode = 'ads';
+
+        if ( ! $post_id || get_post_type($post_id) !== 'kiosk' ) {
+            return new WP_Error('bad_request', 'Missing kiosk_post_id', [ 'status' => 400 ]);
         }
-    ]);
+
+        // Admins can reset any kiosk. Venues can only reset their own kiosk.
+        if ( ! $is_admin ) {
+            $venue_user_id = (string) get_post_meta($post_id, '_meadow_venue_user_id', true);
+            if ( $venue_user_id !== (string) get_current_user_id() ) {
+                return new WP_Error('forbidden', 'Not allowed', [ 'status' => 403 ]);
+            }
+        }
+
+        update_post_meta($post_id, '_meadow_screen_mode', $mode);
+        delete_post_meta($post_id, '_meadow_screen_order_id');
+
+        return [ 'ok' => true, 'mode' => $mode ];
+    },
+]);
+
 });
 
 /**
