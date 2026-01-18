@@ -381,9 +381,12 @@ public function rest_venue_restock( WP_REST_Request $req ) {
     return new WP_REST_Response([ 'ok' => false, 'error' => 'not_logged_in' ], 401);
   }
 
-  if ( ! in_array('venue', (array)$user->roles, true) ) {
-    return new WP_REST_Response([ 'ok' => false, 'error' => 'not_venue' ], 403);
-  }
+  $is_admin = user_can($user, 'manage_options');
+$is_venue = in_array('venue', (array)$user->roles, true);
+
+if ( ! $is_admin && ! $is_venue ) {
+  return new WP_REST_Response([ 'ok' => false, 'error' => 'not_allowed' ], 403);
+}
 
   $params  = $req->get_json_params();
   $updates = $params['updates'] ?? null;
@@ -1738,4 +1741,5 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return true;
     }
 }
+
 
