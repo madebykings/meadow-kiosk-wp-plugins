@@ -15,6 +15,7 @@ require_once MEADOW_KIOSK_CORE_PATH . 'includes/helpers.php';
 require_once MEADOW_KIOSK_CORE_PATH . 'includes/class-meadow-kiosk-core.php';
 require_once MEADOW_KIOSK_CORE_PATH . 'includes/shortcodes.php';
 require_once MEADOW_KIOSK_CORE_PATH . 'includes/order-cleanup.php';
+require_once MEADOW_KIOSK_CORE_PATH . 'includes/admin-debug.php';
 
 function meadow_kiosk_core_boot() {
     $GLOBALS['meadow_kiosk_core'] = new Meadow_Kiosk_Core();
