@@ -1,275 +1,355 @@
 <?php
 /**
  * Plugin Name: Meadow Kiosk Admin Tools
- * Description: Admin metabox controls for Meadow kiosks (reset screen, enter/exit/reboot, motor tests). Depends on Meadow Kiosk Core + Pi Bridge.
- * Version: 1.0.1
+ * Description: Admin metabox + REST bridge tools for Meadow kiosks (Pi control, test vend, screen reset).
+ * Version: 1.0.0
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('MEADOW_KIOSK_ADMIN_TOOLS_VERSION', '1.0.1');
-define('MEADOW_KIOSK_ADMIN_TOOLS_PATH', plugin_dir_path(__FILE__));
+define('MEADOW_KIOSK_ADMIN_TOOLS_VERSION', '2026-01-18-1');
 define('MEADOW_KIOSK_ADMIN_TOOLS_URL', plugin_dir_url(__FILE__));
 
-add_action('plugins_loaded', function(){
-
-    if ( ! defined('MEADOW_KIOSK_CORE_VERSION') ) {
-        add_action('admin_notices', function(){
+/**
+ * Require Meadow Kiosk Core (we use constants + helper funcs like meadow_kiosk_table_name()).
+ */
+add_action('plugins_loaded', function () {
+    if ( ! class_exists('Meadow_Kiosk_Core') ) {
+        add_action('admin_notices', function () {
             echo '<div class="notice notice-error"><p><strong>Meadow Kiosk Admin Tools</strong> requires <strong>Meadow Kiosk Core</strong> to be active.</p></div>';
         });
         return;
     }
-
-    add_action('add_meta_boxes', function(){
-        add_meta_box(
-            'meadow_kiosk_controls',
-            'Meadow — Kiosk Controls',
-            'meadow_admin_tools_render_metabox',
-            'kiosk',
-            'side',
-            'high'
-        );
-    });
-
-    add_action('admin_enqueue_scripts', function($hook){
-        if ( ! in_array($hook, ['post.php','post-new.php'], true) ) return;
-        $screen = function_exists('get_current_screen') ? get_current_screen() : null;
-        if ( ! $screen || $screen->post_type !== 'kiosk' ) return;
-
-        $post_id = isset($_GET['post']) ? (int)$_GET['post'] : 0;
-        if (!$post_id) return;
-
-        wp_enqueue_script('meadow-kiosk-admin-tools', MEADOW_KIOSK_ADMIN_TOOLS_URL . 'assets/admin-tools.js', ['jquery'], MEADOW_KIOSK_ADMIN_TOOLS_VERSION, true);
-
-        $kiosk_id = (int) get_post_meta($post_id, '_meadow_kiosk_id', true);
-
-        wp_localize_script('meadow-kiosk-admin-tools', 'MEADOW_ADMIN_TOOLS', [
-            'postId'  => $post_id,
-            'kioskId' => $kiosk_id,
-            'nonce'   => wp_create_nonce('wp_rest'),
-            'rest'    => [
-                'screenReset' => rest_url('meadow/v1/admin/screen-reset'),
-                'piControl'   => rest_url('meadow/v1/admin/pi/control'),
-                'vendTest'    => rest_url('meadow/v1/admin/pi/vend-test'),
-            ],
-        ]);
-    });
-
-    // Admin REST: reset screen (kept separate from Core)
-    add_action('rest_api_init', function(){
-
-        add_action('rest_api_init', function () {
-
-  $perm = function(WP_REST_Request $req){
-    return is_user_logged_in() && current_user_can('edit_posts');
-  };
-
-  register_rest_route('meadow/v1', '/admin/kiosk-enter', [
-    'methods' => 'POST',
-    'permission_callback' => $perm,
-    'callback' => function(WP_REST_Request $req){
-      return meadow_admin_tools_pi_control_action($req, 'enter_kiosk');
-    }
-  ]);
-
-  register_rest_route('meadow/v1', '/admin/kiosk-exit', [
-    'methods' => 'POST',
-    'permission_callback' => $perm,
-    'callback' => function(WP_REST_Request $req){
-      return meadow_admin_tools_pi_control_action($req, 'exit_kiosk');
-    }
-  ]);
 });
 
 /**
- * Calls the Pi tunnel /admin/control with kiosk_id+key.
+ * Metabox
  */
-function meadow_admin_tools_pi_control_action(WP_REST_Request $req, $action) {
+add_action('add_meta_boxes', function () {
+    add_meta_box(
+        'meadow_kiosk_controls',
+        'Meadow — Kiosk Controls',
+        'meadow_admin_tools_render_metabox',
+        'kiosk',
+        'side',
+        'high'
+    );
+});
 
-  if (function_exists('meadow_kiosk_nocache_headers')) {
-    meadow_kiosk_nocache_headers();
-  }
+/**
+ * Enqueue admin JS only on kiosk edit screen.
+ */
+add_action('admin_enqueue_scripts', function ($hook) {
+    if ( ! in_array($hook, ['post.php','post-new.php'], true) ) return;
 
-  $data = (array) $req->get_json_params();
-  $post_id = (int)($data['kiosk_post_id'] ?? 0);
+    $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+    if ( ! $screen || $screen->post_type !== 'kiosk' ) return;
 
-  if (!$post_id || get_post_type($post_id) !== 'kiosk') {
-    return new WP_Error('bad_request', 'Missing kiosk_post_id', ['status' => 400]);
-  }
-  if (!current_user_can('edit_post', $post_id)) {
-    return new WP_Error('forbidden', 'Not allowed', ['status' => 403]);
-  }
+    $post_id = isset($_GET['post']) ? (int) $_GET['post'] : 0;
+    if ( ! $post_id ) return;
 
-  $kiosk_id = (int) get_post_meta($post_id, '_meadow_kiosk_id', true);
-  if (!$kiosk_id) {
-    return new WP_Error('bad_request', 'Missing _meadow_kiosk_id', ['status' => 400]);
-  }
+    wp_enqueue_script(
+        'meadow-kiosk-admin-tools',
+        MEADOW_KIOSK_ADMIN_TOOLS_URL . 'assets/admin-tools.js',
+        ['jquery'],
+        MEADOW_KIOSK_ADMIN_TOOLS_VERSION,
+        true
+    );
 
-  // ✅ Use the real place your key lives
-  $api_key = (string) get_post_meta($post_id, '_meadow_api_key', true);
-  if (!$api_key) {
-    return new WP_Error('bad_request', 'Missing _meadow_api_key for kiosk', ['status' => 400]);
-  }
+    $kiosk_id = (int) get_post_meta($post_id, '_meadow_kiosk_id', true);
 
-  $pi_base = (string) get_post_meta($post_id, '_meadow_pi_base', true);
-  if (!$pi_base) {
-    $pi_base = "https://kiosk{$kiosk_id}-pi.meadowvending.com";
-  }
+    wp_localize_script('meadow-kiosk-admin-tools', 'MEADOW_ADMIN_TOOLS', [
+        'postId'  => $post_id,
+        'kioskId' => $kiosk_id,
+        'nonce'   => wp_create_nonce('wp_rest'),
+        'rest'    => [
+            'screenReset' => rest_url('meadow/v1/admin/screen-reset'),
+            'piControl'   => rest_url('meadow/v1/admin/pi/control'),
+            'vendTest'    => rest_url('meadow/v1/admin/pi/vend-test'),
+            'piPing'      => rest_url('meadow/v1/admin/pi/ping'),
+            'piStatus'    => rest_url('meadow/v1/admin/pi/status'),
+        ],
+    ]);
+});
 
-  $payload = [
-    'kiosk_id' => $kiosk_id,
-    'key'      => $api_key,
-    'action'   => (string)$action,
-    'payload'  => (object)[],
-  ];
+/**
+ * REST routes (WP-side). These are called by admin-tools.js.
+ */
+add_action('rest_api_init', function () {
+    $perm = function (WP_REST_Request $req) {
+        return is_user_logged_in() && current_user_can('edit_posts');
+    };
 
-  $resp = wp_remote_post(rtrim($pi_base, '/') . '/admin/control', [
-    'timeout' => 10,
-    'headers' => ['Content-Type' => 'application/json'],
-    'body'    => wp_json_encode($payload),
-  ]);
+    register_rest_route('meadow/v1', '/admin/pi/control', [
+        'methods'             => 'POST',
+        'permission_callback' => $perm,
+        'callback'            => 'meadow_admin_tools_rest_pi_control',
+    ]);
 
-  if (is_wp_error($resp)) {
-    return new WP_Error('pi_error', $resp->get_error_message(), ['status' => 502]);
-  }
+    register_rest_route('meadow/v1', '/admin/pi/vend-test', [
+        'methods'             => 'POST',
+        'permission_callback' => $perm,
+        'callback'            => 'meadow_admin_tools_rest_pi_vend_test',
+    ]);
 
-  $code = (int) wp_remote_retrieve_response_code($resp);
-  $body = wp_remote_retrieve_body($resp);
-  $json = json_decode($body, true);
+    register_rest_route('meadow/v1', '/admin/pi/ping', [
+        'methods'             => 'POST',
+        'permission_callback' => $perm,
+        'callback'            => 'meadow_admin_tools_rest_pi_ping',
+    ]);
 
-  return [
-    'ok'        => ($code >= 200 && $code < 300),
-    'pi_status' => $code,
-    'pi_base'   => $pi_base,
-    'sent'      => $payload,
-    'pi'        => is_array($json) ? $json : $body,
-  ];
+    register_rest_route('meadow/v1', '/admin/pi/status', [
+        'methods'             => 'GET',
+        'permission_callback' => $perm,
+        'callback'            => 'meadow_admin_tools_rest_pi_status',
+    ]);
+
+    // Keep screen reset here (separate from Core)
+    register_rest_route('meadow/v1', '/admin/screen-reset', [
+        'methods'             => 'POST',
+        'permission_callback' => function (WP_REST_Request $req) {
+            return is_user_logged_in() && current_user_can('edit_posts');
+        },
+        'callback'            => function (WP_REST_Request $req) {
+            if (function_exists('meadow_kiosk_nocache_headers')) meadow_kiosk_nocache_headers();
+
+            $data = (array) $req->get_json_params();
+            $post_id = (int) ($data['kiosk_post_id'] ?? 0);
+
+            $mode = isset($data['mode']) ? strtolower(trim((string) $data['mode'])) : 'ads';
+            $allowed = ['ads','browse','payment','paid','vending','thankyou','error','payment_failed'];
+            if ( ! in_array($mode, $allowed, true) ) $mode = 'ads';
+
+            if ( ! $post_id || get_post_type($post_id) !== 'kiosk' ) {
+                return new WP_Error('bad_request','Missing kiosk_post_id',[ 'status'=>400 ]);
+            }
+            if ( ! current_user_can('edit_post', $post_id) ) {
+                return new WP_Error('forbidden','Not allowed',[ 'status'=>403 ]);
+            }
+
+            update_post_meta($post_id, '_meadow_screen_mode', $mode);
+            delete_post_meta($post_id, '_meadow_screen_order_id');
+
+            return [ 'ok'=>true, 'mode'=>$mode ];
+        }
+    ]);
+});
+
+/**
+ * ---------- Pi bridge helpers ----------
+ */
+
+function meadow_admin_tools_get_pi_target_or_error(int $post_id) {
+    if (!$post_id || get_post_type($post_id) !== 'kiosk') {
+        return new WP_Error('bad_request', 'Missing kiosk_post_id', ['status' => 400]);
+    }
+    if ( ! current_user_can('edit_post', $post_id) ) {
+        return new WP_Error('forbidden', 'Not allowed', ['status' => 403]);
+    }
+
+    $kiosk_id = (int) get_post_meta($post_id, '_meadow_kiosk_id', true);
+    if (!$kiosk_id) {
+        return new WP_Error('bad_request', 'Missing _meadow_kiosk_id', ['status' => 400]);
+    }
+
+    // key lives on kiosk post
+    $api_key = (string) get_post_meta($post_id, '_meadow_api_key', true);
+    if (!$api_key) {
+        return new WP_Error('bad_request', 'Missing _meadow_api_key for kiosk', ['status' => 400]);
+    }
+
+    // optional override; otherwise default pattern
+    $pi_base = (string) get_post_meta($post_id, '_meadow_pi_base', true);
+    if (!$pi_base) {
+        $pi_base = "https://kiosk{$kiosk_id}-pi.meadowvending.com";
+    }
+
+    return [
+        'kiosk_id' => $kiosk_id,
+        'api_key'  => $api_key,
+        'pi_base'  => rtrim($pi_base, '/'),
+    ];
 }
 
+/**
+ * Calls Pi with headers (preferred, matches your updated pi_api.py).
+ */
+function meadow_admin_tools_call_pi(array $target, string $path, string $method = 'POST', array $body = null, int $timeout = 12) {
+    $url = $target['pi_base'] . $path;
 
+    $headers = [
+        'Content-Type' => 'application/json',
+        // ✅ header auth (your updated pi_api.py accepts these)
+        'X-Meadow-Key' => $target['api_key'],
+        'X-Kiosk-Id'   => (string) $target['kiosk_id'],
+    ];
 
-        register_rest_route('meadow/v1', '/admin/screen-reset', [
-            'methods' => 'POST',
-            'permission_callback' => function(WP_REST_Request $req){
-                return is_user_logged_in() && current_user_can('edit_posts');
-            },
-            'callback' => function(WP_REST_Request $req){
-                meadow_kiosk_nocache_headers();
+    $args = [
+        'timeout' => $timeout,
+        'headers' => $headers,
+        'method'  => $method,
+    ];
 
-                $data = (array) $req->get_json_params();
-                $post_id = (int)($data['kiosk_post_id'] ?? 0);
-                $mode = isset($data['mode']) ? strtolower(trim((string)$data['mode'])) : 'ads';
+    if ($method !== 'GET') {
+        $args['body'] = wp_json_encode($body ?: (object) []);
+    }
 
-                $allowed = ['ads','browse','payment','paid','vending','thankyou','error','payment_failed'];
-                if ( ! in_array($mode, $allowed, true) ) $mode = 'ads';
+    $resp = wp_remote_request($url, $args);
 
-                if (!$post_id || get_post_type($post_id) !== 'kiosk') {
-                    return new WP_Error('bad_request','Missing kiosk_post_id',[ 'status'=>400 ]);
-                }
+    if (is_wp_error($resp)) {
+        return new WP_Error('pi_error', $resp->get_error_message(), ['status' => 502]);
+    }
 
-                if ( ! current_user_can('edit_post', $post_id) ) {
-                    return new WP_Error('forbidden','Not allowed',[ 'status'=>403 ]);
-                }
+    $code = (int) wp_remote_retrieve_response_code($resp);
+    $raw  = (string) wp_remote_retrieve_body($resp);
+    $json = json_decode($raw, true);
 
-                update_post_meta($post_id, '_meadow_screen_mode', $mode);
-                delete_post_meta($post_id, '_meadow_screen_order_id');
-
-                return [ 'ok'=>true, 'mode'=>$mode ];
-            }
-        ]);
-    });
-});
+    return [
+        'ok'        => ($code >= 200 && $code < 300),
+        'pi_status' => $code,
+        'pi_url'    => $url,
+        'pi'        => is_array($json) ? $json : $raw,
+    ];
+}
 
 /**
- * Metabox renderer
+ * ---------- REST callbacks ----------
+ */
+
+function meadow_admin_tools_rest_pi_control(WP_REST_Request $req) {
+    if (function_exists('meadow_kiosk_nocache_headers')) meadow_kiosk_nocache_headers();
+
+    $data = (array) $req->get_json_params();
+    $post_id = (int) ($data['kiosk_post_id'] ?? 0);
+    $action  = (string) ($data['action'] ?? '');
+    $payload = $data['payload'] ?? (object)[];
+
+    $target = meadow_admin_tools_get_pi_target_or_error($post_id);
+    if (is_wp_error($target)) return $target;
+
+    if (!$action) {
+        return new WP_Error('bad_request', 'Missing action', ['status' => 400]);
+    }
+
+    // Pi expects: { action, payload }
+    return meadow_admin_tools_call_pi($target, '/admin/control', 'POST', [
+        'action'  => $action,
+        'payload' => is_array($payload) ? (object) $payload : $payload,
+    ]);
+}
+
+function meadow_admin_tools_rest_pi_vend_test(WP_REST_Request $req) {
+    if (function_exists('meadow_kiosk_nocache_headers')) meadow_kiosk_nocache_headers();
+
+    $data = (array) $req->get_json_params();
+    $post_id = (int) ($data['kiosk_post_id'] ?? 0);
+    $motor   = (int) ($data['motor'] ?? 0);
+
+    $target = meadow_admin_tools_get_pi_target_or_error($post_id);
+    if (is_wp_error($target)) return $target;
+
+    if ($motor <= 0) {
+        return new WP_Error('bad_request', 'Missing motor', ['status' => 400]);
+    }
+
+    // Pi vend-test expects: { motor }
+    return meadow_admin_tools_call_pi($target, '/admin/vend-test', 'POST', [
+        'motor' => $motor,
+    ]);
+}
+
+function meadow_admin_tools_rest_pi_ping(WP_REST_Request $req) {
+    if (function_exists('meadow_kiosk_nocache_headers')) meadow_kiosk_nocache_headers();
+
+    $data = (array) $req->get_json_params();
+    $post_id = (int) ($data['kiosk_post_id'] ?? 0);
+
+    $target = meadow_admin_tools_get_pi_target_or_error($post_id);
+    if (is_wp_error($target)) return $target;
+
+    return meadow_admin_tools_call_pi($target, '/admin/ping', 'POST', (object)[], 8);
+}
+
+function meadow_admin_tools_rest_pi_status(WP_REST_Request $req) {
+    if (function_exists('meadow_kiosk_nocache_headers')) meadow_kiosk_nocache_headers();
+
+    $post_id = (int) $req->get_param('kiosk_post_id');
+
+    $target = meadow_admin_tools_get_pi_target_or_error($post_id);
+    if (is_wp_error($target)) return $target;
+
+    return meadow_admin_tools_call_pi($target, '/admin/status', 'GET', null, 8);
+}
+
+/**
+ * ---------- Metabox renderer ----------
  */
 function meadow_admin_tools_render_metabox($post) {
-
     if ( ! $post || $post->post_type !== 'kiosk' ) return;
 
     $kiosk_id = (int) get_post_meta($post->ID, '_meadow_kiosk_id', true);
 
-    // Read from migrated table via virtual meta / table if present
+    // Read from migrated table if present (you already do this)
     global $wpdb;
-    $table = meadow_kiosk_table_name();
-    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE kiosk_post_id=%d", $post->ID), ARRAY_A);
+    $mode = 'ads';
+    $last = '';
+    $git  = '';
+    $rev  = 0;
 
-    $mode = $row && $row['screen_mode'] !== '' ? (string)$row['screen_mode'] : (string)(get_post_meta($post->ID,'_meadow_screen_mode',true) ?: 'ads');
-    $last = $row && !empty($row['last_seen_utc']) ? (string)$row['last_seen_utc'] : '';
-    $git  = $row && !empty($row['config_version']) ? (string)$row['config_version'] : '';
-    $rev  = $row ? (int)$row['revision'] : 0;
+    if (function_exists('meadow_kiosk_table_name')) {
+        $table = meadow_kiosk_table_name();
+        if ($table) {
+            $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE kiosk_post_id=%d", $post->ID), ARRAY_A);
+            if ($row) {
+                $mode = ($row['screen_mode'] !== '' ? (string)$row['screen_mode'] : $mode);
+                $last = (!empty($row['last_seen_utc']) ? (string)$row['last_seen_utc'] : '');
+                $git  = (!empty($row['config_version']) ? (string)$row['config_version'] : '');
+                $rev  = (int)($row['revision'] ?? 0);
+            }
+        }
+    } else {
+        $mode = (string)(get_post_meta($post->ID,'_meadow_screen_mode',true) ?: 'ads');
+    }
 
-    echo '<div class="meadow-kiosk-controls" style="font-size:12px; line-height:1.45;">';
-    echo '<div><strong>Kiosk ID:</strong> ' . esc_html($kiosk_id ?: '—') . '</div>';
-    echo '<div><strong>Screen:</strong> ' . esc_html($mode) . '</div>';
-    echo '<div><strong>Last seen (UTC):</strong> ' . esc_html($last ?: '—') . '</div>';
-    echo '<div><strong>Revision:</strong> ' . esc_html($rev) . '</div>';
-    echo '<div><strong>Pi git:</strong> ' . esc_html($git ?: '—') . '</div>';
-    echo '<div class="meadow-ctrl-status" style="margin-top:8px; color:#555;"></div>';
-    echo '</div>';
+    echo '<div class="meadow-admin-tools">';
+    echo '<p><strong>Kiosk ID:</strong> ' . esc_html($kiosk_id ?: '—') . '</p>';
+    echo '<p><strong>Screen:</strong> ' . esc_html($mode) . '</p>';
+    echo '<p><strong>Last seen (UTC):</strong> ' . esc_html($last ?: '—') . '</p>';
+    echo '<p><strong>Revision:</strong> ' . esc_html($rev) . '</p>';
+    echo '<p><strong>Pi git:</strong> ' . esc_html($git ?: '—') . '</p>';
 
-    echo '<hr style="margin:12px 0;" />';
+    echo '<hr/>';
 
-    echo '<p style="margin-top:8px;">
-  <button type="button" class="button button-primary" id="meadowEnterKiosk">Enter kiosk</button>
-  <button type="button" class="button" id="meadowExitKiosk" style="margin-left:6px;">Exit kiosk</button>
-</p>
-<pre id="meadowKioskCtlOut" style="white-space:pre-wrap; background:#111; color:#0f0; padding:8px; max-height:160px; overflow:auto;"></pre>';
+    echo '<p style="margin:0 0 6px;"><strong>Pi controls</strong></p>';
 
-    //echo '<div style="display:grid; gap:6px;">';
-    //echo '<a href="#" class="button button-secondary" style="width:100%;" data-meadow-reset="ads">Reset screen → Ads</a>';
-    //echo '<a href="#" class="button button-secondary" style="width:100%;" data-meadow-reset="browse">Reset screen → Browse</a>';
-    //echo '</div>';
+    // Buttons (wired by JS)
+    $btn = function($label, $action, $extra = '') use ($post) {
+        $label_esc = esc_html($label);
+        $action_esc = esc_attr($action);
+        $extra_attr = $extra ? ' ' . $extra : '';
+        echo "<button type=\"button\" class=\"button meadow-pi-action\" data-kiosk-post-id=\"" . (int)$post->ID . "\" data-action=\"{$action_esc}\"{$extra_attr}>{$label_esc}</button> ";
+    };
 
-    echo '<hr style="margin:12px 0;" />';
+    $btn('Enter kiosk',  'enter_kiosk');
+    $btn('Exit kiosk',   'exit_kiosk');
+    echo '<br/><br/>';
+    $btn('Reload kiosk', 'reload_kiosk');
+    $btn('Restart service', 'restart_service');
+    echo '<br/><br/>';
+    $btn('Reboot Pi',    'reboot');
+    $btn('Shutdown Pi',  'shutdown');
+    echo '<br/><br/>';
+    $btn('Kill all',     'kill_all');
+    $btn('Ping',         'ping');
+    echo '<div class="meadow-pi-status" style="margin-top:8px;font-size:12px;line-height:1.35;"></div>';
 
-    // Device ops (Pi Bridge required)
-    //echo '<div style="display:grid; gap:6px;">';
-    //echo '<a href="#" class="button" style="width:100%;" data-meadow-pi-action="enter_kiosk">Enter kiosk</a>';
-    //echo '<a href="#" class="button" style="width:100%;" data-meadow-pi-action="exit_kiosk">Exit kiosk</a>';
-    //echo '<a href="#" class="button" style="width:100%;" data-meadow-pi-action="reload_kiosk">Reload kiosk</a>';
-    //echo '<a href="#" class="button" style="width:100%;" data-meadow-pi-action="reboot">Reboot Pi</a>';
-    //echo '<a href="#" class="button" style="width:100%;" data-meadow-pi-action="shutdown">Shutdown Pi</a>';
-    //echo '</div>';
+    echo '<hr/>';
 
-    echo '<hr style="margin:12px 0;" />';
-
-$pi_control_url = esc_js( rest_url('meadow/v1/admin/pi/control') );
-$nonce          = esc_js( wp_create_nonce('wp_rest') );
-$post_id_js     = (int) $post->ID;
-
-echo "<script>
-(() => {
-  const out = document.getElementById('meadowKioskCtlOut');
-  const postId = {$post_id_js};
-  const url = '{$pi_control_url}';
-
-  async function call(action){
-    out.textContent = 'Sending ' + action + '...\\n';
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-WP-Nonce': '{$nonce}'
-      },
-      body: JSON.stringify({ kiosk_post_id: postId, action })
-    });
-    const j = await r.json().catch(() => ({}));
-    out.textContent = 'HTTP ' + r.status + '\\n' + JSON.stringify(j, null, 2);
-  }
-
-  document.getElementById('meadowEnterKiosk')?.addEventListener('click', () => call('enter_kiosk'));
-  document.getElementById('meadowExitKiosk')?.addEventListener('click',  () => call('exit_kiosk'));
-})();
-</script>";
-
-
-
-    // Motors from repeater
+    // Motors from repeater (same idea you already have)
     $slots = get_post_meta($post->ID, Meadow_Kiosk_Core::SLOT_REPEATER_META_KEY, true);
     if ( ! is_array($slots) ) $slots = [];
-
     $enabled_motors = [];
+
     foreach ($slots as $row2) {
         $raw = $row2[ Meadow_Kiosk_Core::SLOT_FIELD_ENABLED ] ?? null;
         $enabled = true;
@@ -278,18 +358,23 @@ echo "<script>
             $enabled = in_array($s, ['1','true','yes','y','on'], true);
         }
         if ( ! $enabled ) continue;
+
         $motor = (int) ($row2[ Meadow_Kiosk_Core::SLOT_FIELD_MOTOR ] ?? 0);
         if ($motor) $enabled_motors[] = $motor;
     }
+
     sort($enabled_motors);
 
-    echo '<div style="font-size:12px; margin-bottom:6px;"><strong>Test vend motors</strong></div>';
+    echo '<p style="margin:0 0 6px;"><strong>Test vend motors</strong></p>';
+
     if ( empty($enabled_motors) ) {
-        echo '<div style="font-size:12px; color:#666;">No enabled motors found in repeater.</div>';
+        echo '<p style="margin:0;color:#666;">No enabled motors found in repeater.</p>';
     } else {
         foreach ($enabled_motors as $m) {
-            echo '<a href="#" class="button" style="width:100%; margin:0 0 6px 0;" data-meadow-motor="' . (int)$m . '">Spin motor ' . (int)$m . '</a>';
+            $m = (int) $m;
+            echo '<button type="button" class="button meadow-vend-test" data-kiosk-post-id="' . (int)$post->ID . '" data-motor="' . $m . '">Spin motor ' . $m . '</button> ';
         }
     }
-}
 
+    echo '</div>';
+}
