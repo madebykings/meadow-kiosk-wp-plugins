@@ -52,15 +52,16 @@
 
     // Special actions that call dedicated routes
     if (action === "ping") {
-      apiPost(MEADOW_ADMIN_TOOLS.rest.piPing, nonce, { kiosk_post_id: postId })
-        .done((r) => {
-          setStatus($box, r && r.ok ? "Ping OK ✅" : ("Ping failed ❌ " + escapeHtml(JSON.stringify(r))));
-        })
-        .fail((xhr) => {
-          setStatus($box, "Ping failed ❌ " + escapeHtml(xhr.responseText || xhr.statusText));
-        });
-      return;
-    }
+  apiGet(MEADOW_ADMIN_TOOLS.rest.piStatus, nonce, { kiosk_post_id: postId })
+    .done((r) => {
+      const ok = !!(r && r.ok && r.pi && r.pi.ok);
+      setStatus($box, ok ? "Pi status OK ✅" : ("Status failed ❌ " + escapeHtml(JSON.stringify(r))));
+    })
+    .fail((xhr) => {
+      setStatus($box, "Status failed ❌ " + escapeHtml(xhr.responseText || xhr.statusText));
+    });
+  return;
+}
 
     // Default: /admin/pi/control
     apiPost(MEADOW_ADMIN_TOOLS.rest.piControl, nonce, {
@@ -127,3 +128,4 @@
   });
 
 })(jQuery);
+
