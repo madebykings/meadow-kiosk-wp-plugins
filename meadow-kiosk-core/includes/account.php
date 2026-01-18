@@ -157,27 +157,28 @@ echo '</ul>';
               return;
             }
 
-            msg.textContent =
+msg.textContent =
   'Saved ✓ (' + (j.changed ? j.changed.length : 0) + ' rows) — reloading kiosk…';
 
 try {
-  await fetch('/wp-json/meadow/v1/kiosk-screen', {
+  await fetch('/wp-json/meadow/v1/admin/screen-reset', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'X-WP-Nonce': nonce
     },
     body: JSON.stringify({
-      kiosk_id: <?php echo (int)$kiosk_id; ?>,
-      action: 'reload'
+      kiosk_post_id: <?php echo (int) $kiosk_id; ?>,
+      mode: 'ads' // or 'browse' if you prefer
     })
   });
 } catch (e) {
-  // Non-fatal — stock is already saved
+  // Non-fatal: stock is already saved
 }
 
-// Optional: refresh this page so UI matches kiosk
+// Optional: refresh the page so UI matches kiosk state
 setTimeout(() => location.reload(), 600);
+
 
           } catch (e) {
             msg.textContent = 'Failed: ' + e.message;
