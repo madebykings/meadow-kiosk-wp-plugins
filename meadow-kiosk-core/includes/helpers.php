@@ -6,11 +6,18 @@
 if ( ! defined('ABSPATH') ) exit;
 
 /**
- * DB table name for kiosk state.
+ * Returns hhg_meadow_kiosk_state (via $wpdb->prefix).
  */
-function meadow_kiosk_state_table_name(): string {
+function meadow_kiosk_table_name(): string {
   global $wpdb;
   return $wpdb->prefix . 'meadow_kiosk_state';
+}
+
+/**
+ * Backwards/forwards compatibility alias (if any newer code calls this).
+ */
+function meadow_kiosk_state_table_name(): string {
+  return meadow_kiosk_table_name();
 }
 
 /**
