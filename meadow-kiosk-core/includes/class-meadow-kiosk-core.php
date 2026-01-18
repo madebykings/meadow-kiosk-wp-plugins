@@ -38,7 +38,7 @@ class Meadow_Kiosk_Core {
 
         // Legacy WC flow (keep if any legacy checkout remains)
         add_action( 'woocommerce_payment_complete',       [ $this, 'handle_order_completed' ] );
-        add_action( 'woocommerce_order_status_completed', [ $this, 'handle_order_completed' ] );
+        //add_action( 'woocommerce_order_status_completed', [ $this, 'handle_order_completed' ] );
 
         // Ads: subscription linking + kiosk limit enforcement
         add_action( 'add_meta_boxes', [ $this, 'add_ad_subscription_metabox' ] );
@@ -221,6 +221,22 @@ class Meadow_Kiosk_Core {
         meadow_kiosk_nocache_headers();
     }
 
+        /**
+     * JetEngine repeater safety: ensure rows are valid arrays and keys are 0..n-1.
+     * Prevents admin UI oddities caused by gappy numeric indexes.
+     */
+    private function normalize_slots_array( $slots ) {
+        if ( ! is_array( $slots ) ) return [];
+
+        // Keep only rows that are arrays
+        $slots = array_filter( $slots, 'is_array' );
+
+        // Reindex to 0..n-1 (critical)
+        $slots = array_values( $slots );
+
+        return $slots;
+    }
+
     private function bool_param($v) {
         return filter_var($v, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
     }
@@ -371,7 +387,7 @@ class Meadow_Kiosk_Core {
 
     }
 
-    /* ---------------------------------------------
+/* ---------------------------------------------
  * REST: venue restock (NEW – MUST BE STANDALONE)
  * ------------------------------------------- */
 public function rest_venue_restock( WP_REST_Request $req ) {
@@ -382,11 +398,11 @@ public function rest_venue_restock( WP_REST_Request $req ) {
   }
 
   $is_admin = user_can($user, 'manage_options');
-$is_venue = in_array('venue', (array)$user->roles, true);
+  $is_venue = in_array('venue', (array)$user->roles, true);
 
-if ( ! $is_admin && ! $is_venue ) {
-  return new WP_REST_Response([ 'ok' => false, 'error' => 'not_allowed' ], 403);
-}
+  if ( ! $is_admin && ! $is_venue ) {
+    return new WP_REST_Response([ 'ok' => false, 'error' => 'not_allowed' ], 403);
+  }
 
   $params  = $req->get_json_params();
   $updates = $params['updates'] ?? null;
@@ -412,13 +428,23 @@ if ( ! $is_admin && ! $is_venue ) {
 
   // Load repeater
   $slots = get_post_meta($kiosk_id, self::SLOT_REPEATER_META_KEY, true);
-  if ( ! is_array($slots) ) $slots = [];
+
+  // Normalize slots to prevent "ghost rows" caused by gappy numeric keys / non-array rows
+  $before_count = is_array($slots) ? count($slots) : 0;
+  $before_keys  = is_array($slots) ? implode(',', array_keys($slots)) : '';
+  $slots = $this->normalize_slots_array( $slots );
+
+  // Optional: log if normalization changed something (safe to remove later)
+  if ( $before_count && (count($slots) !== $before_count || ($before_keys !== '' && $before_keys !== implode(',', array_keys($slots))) ) ) {
+    error_log('[Meadow] rest_venue_restock: normalized slots (count/keys changed) kiosk_id=' . $kiosk_id . ' before_count=' . $before_count . ' after_count=' . count($slots) . ' before_keys=' . $before_keys . ' after_keys=' . implode(',', array_keys($slots)));
+  }
 
   // Map motor → repeater index
   $motor_to_idx = [];
   foreach ($slots as $idx => $row) {
+    if ( ! is_array($row) ) continue;
     $m = intval($row[self::SLOT_FIELD_MOTOR] ?? 0);
-    if ($m > 0) $motor_to_idx[$m] = $idx;
+    if ($m > 0) $motor_to_idx[$m] = (int)$idx;
   }
 
   $changed = [];
@@ -432,10 +458,15 @@ if ( ! $is_admin && ! $is_venue ) {
     if ($stock < 0) $stock = 0;
 
     $idx = $motor_to_idx[$motor];
+    if ( ! isset($slots[$idx]) || ! is_array($slots[$idx]) ) continue;
+
     $slots[$idx][ self::SLOT_FIELD_STOCK ] = $stock;
 
     $changed[] = [ 'motor' => $motor, 'stock' => $stock ];
   }
+
+  // Normalize again right before save (belt & braces)
+  $slots = $this->normalize_slots_array( $slots );
 
   update_post_meta($kiosk_id, self::SLOT_REPEATER_META_KEY, $slots);
   update_post_meta($kiosk_id, '_meadow_config_version', time());
@@ -446,6 +477,7 @@ if ( ! $is_admin && ! $is_venue ) {
     'changed'  => $changed,
   ], 200);
 }
+
 
 
     /* ---------------------------------------------
@@ -995,9 +1027,18 @@ public function rest_vend_result( WP_REST_Request $req ) {
         $slot_index = (int) get_post_meta($pay_post->ID, '_meadow_slot_index', true);
 
         $slots = get_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, true);
-        if ( ! is_array($slots) ) $slots = [];
 
-        $new_stock = null;
+        // Normalize slots to prevent "ghost rows" caused by gappy numeric keys / non-array rows
+        $before_count = is_array($slots) ? count($slots) : 0;
+        $before_keys  = is_array($slots) ? implode(',', array_keys($slots)) : '';
+        $slots = $this->normalize_slots_array( $slots );
+
+        // Optional: log if normalization changed something (safe to remove later)
+        if ( $before_count && (count($slots) !== $before_count || ($before_keys !== '' && $before_keys !== implode(',', array_keys($slots))) ) ) {
+            error_log('[Meadow] rest_vend_result: normalized slots (count/keys changed) kiosk_id=' . $kiosk_id . ' before_count=' . $before_count . ' after_count=' . count($slots) . ' before_keys=' . $before_keys . ' after_keys=' . implode(',', array_keys($slots)));
+        }
+
+        $new_stock  = null;
         $prev_stock = null;
 
         // First try: use stored slot_index (fast path)
@@ -1018,6 +1059,9 @@ public function rest_vend_result( WP_REST_Request $req ) {
             $prev_stock = (int) ($slots[$slot_index][self::SLOT_FIELD_STOCK] ?? 0);
             $new_stock  = max(0, $prev_stock - 1);
             $slots[$slot_index][self::SLOT_FIELD_STOCK] = $new_stock;
+
+            // Normalize again right before save (belt & braces)
+            $slots = $this->normalize_slots_array( $slots );
 
             update_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, $slots);
 
@@ -1189,69 +1233,64 @@ public function rest_vend_result( WP_REST_Request $req ) {
      * ------------------------------------------- */
 
     public function handle_order_completed( $order_id ) {
-        $order = wc_get_order($order_id);
-        if ( ! $order ) return;
+    $order = wc_get_order($order_id);
+    if ( ! $order ) return;
 
-        $kiosk_id = (int) $order->get_meta('_meadow_kiosk_id');
-        $motor    = (int) $order->get_meta('_meadow_motor');
-        if ( ! $kiosk_id || ! $motor ) return;
+    $kiosk_id = (int) $order->get_meta('_meadow_kiosk_id');
+    $motor    = (int) $order->get_meta('_meadow_motor');
+    if ( ! $kiosk_id || ! $motor ) return;
 
-        $kiosk = meadow_kiosk_get_kiosk_by_kiosk_id($kiosk_id);
-        if ( ! $kiosk ) return;
+    $kiosk = meadow_kiosk_get_kiosk_by_kiosk_id($kiosk_id);
+    if ( ! $kiosk ) return;
 
-        $slots = get_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, true);
-        if ( ! is_array($slots) ) return;
+    $slots = get_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, true);
 
-        $slot_index = null;
-        $slot_data  = null;
-        foreach ( $slots as $index => $row ) {
-            if ( (int) ($row[self::SLOT_FIELD_MOTOR] ?? 0) === $motor ) {
-                $slot_index = $index;
-                $slot_data  = $row;
-                break;
-            }
-        }
-        if ( $slot_index === null ) return;
+    // Normalize slots to prevent "ghost rows" caused by gappy numeric keys / non-array rows
+    $before_count = is_array($slots) ? count($slots) : 0;
+    $before_keys  = is_array($slots) ? implode(',', array_keys($slots)) : '';
+    $slots = $this->normalize_slots_array( $slots );
 
-        $enabled = $this->slot_enabled($slot_data[self::SLOT_FIELD_ENABLED] ?? null);
-        if ( ! $enabled ) return;
+    // If no slots, bail
+    if ( ! is_array($slots) || empty($slots) ) return;
 
-        $current    = (int) ($slot_data[self::SLOT_FIELD_STOCK] ?? 0);
-        $product_id = (int) ($slot_data[self::SLOT_FIELD_PRODUCT] ?? 0);
-
-        $slots[$slot_index][self::SLOT_FIELD_STOCK] = max(0, $current - 1);
-        update_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, $slots);
-        $new = max(0, $current - 1);
-
-        if ($current > 2 && $new === 2) $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new,'low',$order_id);
-        elseif ($current > 0 && $new === 0) $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new,'out',$order_id);
+    // Optional: log if normalization changed something (safe to remove later)
+    if ( $before_count && (count($slots) !== $before_count || ($before_keys !== '' && $before_keys !== implode(',', array_keys($slots))) ) ) {
+        error_log('[Meadow] handle_order_completed: normalized slots (count/keys changed) kiosk_id=' . $kiosk_id . ' order_id=' . $order_id . ' before_count=' . $before_count . ' after_count=' . count($slots) . ' before_keys=' . $before_keys . ' after_keys=' . implode(',', array_keys($slots)));
     }
 
-    private function send_stock_alert( $kiosk_id, $slot_index, $product_id, $new_stock, $type, $order_id ) {
-        $kiosk = meadow_kiosk_get_kiosk_by_kiosk_id($kiosk_id);
-        if ( ! $kiosk ) return;
+    $slot_index = null;
+    $slot_data  = null;
 
-        $to_email = get_post_meta($kiosk->ID,'_meadow_stock_alert_email',true)
-                 ?: get_option('admin_email');
-        if ( ! $to_email ) return;
-
-        $product = $product_id ? get_the_title($product_id) : 'Unknown product';
-        $kiosk_label = $kiosk->post_title ?: "Kiosk $kiosk_id";
-        $slot_label = "Motor " . ($slot_index+1);
-
-        if ( $type === 'low' ) {
-            $subject = "[$kiosk_label] Low stock: $product";
-            $body = "Stock low in slot $slot_label\n";
-        } else {
-            $subject = "[$kiosk_label] OUT OF STOCK: $product";
-            $body = "Out of stock in slot $slot_label\n";
+    foreach ( $slots as $index => $row ) {
+        if ( is_array($row) && (int) ($row[self::SLOT_FIELD_MOTOR] ?? 0) === $motor ) {
+            $slot_index = (int)$index;
+            $slot_data  = $row;
+            break;
         }
-
-        $body .= "Stock remaining: $new_stock\n";
-        if ($order_id) $body .= "Order: $order_id\n";
-
-        wp_mail($to_email,$subject,$body);
     }
+    if ( $slot_index === null ) return;
+
+    $enabled = $this->slot_enabled($slot_data[self::SLOT_FIELD_ENABLED] ?? null);
+    if ( ! $enabled ) return;
+
+    $current    = (int) ($slot_data[self::SLOT_FIELD_STOCK] ?? 0);
+    $product_id = (int) ($slot_data[self::SLOT_FIELD_PRODUCT] ?? 0);
+
+    $new = max(0, $current - 1);
+    $slots[$slot_index][self::SLOT_FIELD_STOCK] = $new;
+
+    // Normalize again right before save (belt & braces)
+    $slots = $this->normalize_slots_array( $slots );
+
+    update_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, $slots);
+
+    if ($current > 2 && $new === 2) {
+        $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new,'low',$order_id);
+    } elseif ($current > 0 && $new === 0) {
+        $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new,'out',$order_id);
+    }
+}
+
 
     /* ---------------------------------------------
      * Admin filters
@@ -1741,5 +1780,3 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return true;
     }
 }
-
-
