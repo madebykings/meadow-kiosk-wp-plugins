@@ -148,21 +148,50 @@ function meadow_admin_tools_get_pi_target_or_error(int $post_id) {
     }
 
     $kiosk_id = (int) get_post_meta($post_id, '_meadow_kiosk_id', true);
-    if (!$kiosk_id) {
-        return new WP_Error('bad_request', 'Missing _meadow_kiosk_id', ['status' => 400]);
-    }
 
-    // key lives on kiosk post
-    $api_key = (string) get_post_meta($post_id, '_meadow_api_key', true);
-    if (!$api_key) {
-        return new WP_Error('bad_request', 'Missing _meadow_api_key for kiosk', ['status' => 400]);
-    }
+// key lives on kiosk post
+$api_key = (string) get_post_meta($post_id, '_meadow_api_key', true);
+if (!$api_key) {
+    return new WP_Error('bad_request', 'Missing _meadow_api_key for kiosk', ['status' => 400]);
+}
 
-    // optional override; otherwise default pattern
-    $pi_base = (string) get_post_meta($post_id, '_meadow_pi_base', true);
-    if (!$pi_base) {
-        $pi_base = "https://kiosk{$kiosk_id}-pi.meadowvending.com";
+// optional override; otherwise default pattern
+$pi_base = (string) get_post_meta($post_id, '_meadow_pi_base', true);
+if (!$pi_base) {
+    // default pattern
+    $maybe = $kiosk_id ?: 0;
+    $pi_base = $maybe ? "https://kiosk{$maybe}-pi.meadowvending.com" : "";
+}
+
+// If kiosk_id is missing/zero OR wrong, infer from pi_base hostname like kiosk1-pi.meadowvending.com
+$pi_base = rtrim((string)$pi_base, '/');
+
+if ((!$kiosk_id) && $pi_base) {
+    if (preg_match('~//kiosk(\d+)-pi\.~i', $pi_base, $m)) {
+        $kiosk_id = (int)$m[1];
     }
+}
+
+// If kiosk_id exists but doesn't match the pi_base hostname, trust pi_base.
+// (This is exactly your case: you hit kiosk1-pi but sent a different kiosk_id.)
+if ($kiosk_id && $pi_base) {
+    if (preg_match('~//kiosk(\d+)-pi\.~i', $pi_base, $m)) {
+        $host_id = (int)$m[1];
+        if ($host_id && $host_id !== $kiosk_id) {
+            $kiosk_id = $host_id;
+        }
+    }
+}
+
+if (!$kiosk_id) {
+    return new WP_Error('bad_request', 'Missing kiosk_id (set _meadow_kiosk_id or _meadow_pi_base like https://kiosk1-pi...)', ['status' => 400]);
+}
+
+if (!$pi_base) {
+    // if still empty, build it from kiosk_id
+    $pi_base = "https://kiosk{$kiosk_id}-pi.meadowvending.com";
+}
+
 
     return [
         'kiosk_id' => $kiosk_id,
