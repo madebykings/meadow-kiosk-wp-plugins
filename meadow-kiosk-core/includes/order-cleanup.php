@@ -16,6 +16,9 @@ class Meadow_Order_Cleanup {
 
   const PAY_POST_TYPE = 'meadow_payment';
 
+  const ORDER_META_KIOSK_ID   = '_meadow_kiosk_id';
+  const ORDER_META_SESSION_ID = '_meadow_session_id';
+
   const META_SESSION_ID = '_meadow_session_id';
   const META_ORDER_ID   = '_meadow_order_id';
   const META_STATUS     = '_meadow_status';
@@ -204,6 +207,42 @@ class Meadow_Order_Cleanup {
       delete_transient(self::LOCK_TRANSIENT);
     }
   }
+
+  private static function find_wc_order_candidates(int $min_ts, int $max_ts, int $limit): array {
+  if ( ! function_exists('wc_get_orders') ) return [];
+
+  // Only kiosk orders: require at least one Meadow marker meta
+  $orders = wc_get_orders([
+    'limit'        => $limit,
+    'status'       => ['on-hold','pending','failed'],
+    'orderby'      => 'date',
+    'order'        => 'ASC',
+    'date_created' => self::ts_range_to_wc_date_query($min_ts, $max_ts),
+    'meta_query'   => [
+      'relation' => 'OR',
+      [
+        'key'     => self::ORDER_META_KIOSK_ID,
+        'compare' => 'EXISTS',
+      ],
+      [
+        'key'     => self::ORDER_META_SESSION_ID,
+        'compare' => 'EXISTS',
+      ],
+    ],
+  ]);
+
+  return is_array($orders) ? $orders : [];
+}
+
+private static function ts_range_to_wc_date_query(int $min_ts, int $max_ts): array {
+  // We want: older than min_ts AND newer than max_ts
+  // WC date_created accepts a string or an array with 'after'/'before'
+  return [
+    'after'  => gmdate('Y-m-d H:i:s', $max_ts),
+    'before' => gmdate('Y-m-d H:i:s', $min_ts),
+    'inclusive' => true,
+  ];
+}
 
   private static function find_candidates(int $min_ts, int $max_ts, int $limit): array {
     $stuck = self::stuck_statuses();
