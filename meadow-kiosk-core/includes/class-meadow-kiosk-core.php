@@ -1064,6 +1064,7 @@ public function rest_vend_result( WP_REST_Request $req ) {
             $slots = $this->normalize_slots_array( $slots );
 
             update_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, $slots);
+            update_post_meta($kiosk->ID, '_meadow_config_version', time()); // stock changed -> bump version
 
             if ($prev_stock > 2 && $new_stock === 2) {
                 $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new_stock,'low',$order_id);
