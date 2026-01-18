@@ -208,9 +208,10 @@ function meadow_admin_tools_call_pi(array $target, string $path, string $method 
 
     $headers = [
         'Content-Type' => 'application/json',
-        // ✅ header auth (your updated pi_api.py accepts these)
         'X-Meadow-Key' => $target['api_key'],
         'X-Kiosk-Id'   => (string) $target['kiosk_id'],
+        // Optional: also support Bearer style if you ever use it
+        // 'Authorization' => 'Bearer ' . $target['api_key'],
     ];
 
     $args = [
@@ -220,7 +221,12 @@ function meadow_admin_tools_call_pi(array $target, string $path, string $method 
     ];
 
     if ($method !== 'GET') {
-        $args['body'] = wp_json_encode($body ?: (object) []);
+        // ✅ include body auth too (backwards-compatible, prevents “missing id” bugs)
+        $payload = is_array($body) ? $body : [];
+        $payload['kiosk_id'] = (int) $target['kiosk_id'];
+        $payload['key']      = (string) $target['api_key'];
+
+        $args['body'] = wp_json_encode($payload);
     }
 
     $resp = wp_remote_request($url, $args);
@@ -240,6 +246,7 @@ function meadow_admin_tools_call_pi(array $target, string $path, string $method 
         'pi'        => is_array($json) ? $json : $raw,
     ];
 }
+
 
 /**
  * ---------- REST callbacks ----------
@@ -407,3 +414,4 @@ function meadow_admin_tools_render_metabox($post) {
 
     echo '</div>';
 }
+
