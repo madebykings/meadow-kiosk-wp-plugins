@@ -66,7 +66,6 @@ add_action('admin_enqueue_scripts', function ($hook) {
             'screenReset' => rest_url('meadow/v1/admin/screen-reset'),
             'piControl'   => rest_url('meadow/v1/admin/pi/control'),
             'vendTest'    => rest_url('meadow/v1/admin/pi/vend-test'),
-            'piPing'      => rest_url('meadow/v1/admin/pi/ping'),
             'piStatus'    => rest_url('meadow/v1/admin/pi/status'),
         ],
     ]);
@@ -90,12 +89,6 @@ add_action('rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => $perm,
         'callback'            => 'meadow_admin_tools_rest_pi_vend_test',
-    ]);
-
-    register_rest_route('meadow/v1', '/admin/pi/ping', [
-        'methods'             => 'POST',
-        'permission_callback' => $perm,
-        'callback'            => 'meadow_admin_tools_rest_pi_ping',
     ]);
 
     register_rest_route('meadow/v1', '/admin/pi/status', [
@@ -294,18 +287,6 @@ function meadow_admin_tools_rest_pi_vend_test(WP_REST_Request $req) {
     ]);
 }
 
-function meadow_admin_tools_rest_pi_ping(WP_REST_Request $req) {
-    if (function_exists('meadow_kiosk_nocache_headers')) meadow_kiosk_nocache_headers();
-
-    $data = (array) $req->get_json_params();
-    $post_id = (int) ($data['kiosk_post_id'] ?? 0);
-
-    $target = meadow_admin_tools_get_pi_target_or_error($post_id);
-    if (is_wp_error($target)) return $target;
-
-    return meadow_admin_tools_call_pi($target, '/admin/ping', 'POST', (object)[], 8);
-}
-
 function meadow_admin_tools_rest_pi_status(WP_REST_Request $req) {
     if (function_exists('meadow_kiosk_nocache_headers')) meadow_kiosk_nocache_headers();
 
@@ -376,7 +357,6 @@ function meadow_admin_tools_render_metabox($post) {
     $btn('Shutdown Pi',  'shutdown');
     echo '<br/><br/>';
     $btn('Kill all',     'kill_all');
-    $btn('Ping',         'ping');
     echo '<div class="meadow-pi-status" style="margin-top:8px;font-size:12px;line-height:1.35;"></div>';
 
     echo '<hr/>';
@@ -414,4 +394,3 @@ function meadow_admin_tools_render_metabox($post) {
 
     echo '</div>';
 }
-
