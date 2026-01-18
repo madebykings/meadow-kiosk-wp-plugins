@@ -20,3 +20,10 @@ function meadow_kiosk_core_boot() {
     $GLOBALS['meadow_kiosk_core'] = new Meadow_Kiosk_Core();
 }
 add_action('plugins_loaded', 'meadow_kiosk_core_boot');
+
+register_deactivation_hook(__FILE__, function () {
+  if (class_exists('Meadow_Order_Cleanup')) {
+    Meadow_Order_Cleanup::unschedule_cron();
+  }
+});
+
