@@ -161,6 +161,24 @@ msg.textContent =
   'Saved ✓ (' + (j.changed ? j.changed.length : 0) + ' rows) — reloading kiosk…';
 
 try {
+  // 🔥 This is the SAME mechanism as the admin metabox “Reload kiosk” button
+  const rPi = await fetch('/wp-json/meadow/v1/admin/pi/control', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-WP-Nonce': nonce
+    },
+    body: JSON.stringify({
+      kiosk_post_id: <?php echo (int)$kiosk_id; ?>,
+      action: 'reload_kiosk',
+      payload: {}
+    })
+  });
+
+  const jPi = await rPi.json().catch(() => ({}));
+  console.log('pi/control reload_kiosk:', rPi.status, jPi);
+
+  // Optional: also reset WP screen mode (nice for UI consistency)
   await fetch('/wp-json/meadow/v1/admin/screen-reset', {
     method: 'POST',
     headers: {
@@ -168,16 +186,18 @@ try {
       'X-WP-Nonce': nonce
     },
     body: JSON.stringify({
-      kiosk_post_id: <?php echo (int) $kiosk_id; ?>,
-      mode: 'ads' // or 'browse' if you prefer
+      kiosk_post_id: <?php echo (int)$kiosk_id; ?>,
+      mode: 'ads'
     })
   });
+
 } catch (e) {
-  // Non-fatal: stock is already saved
+  console.log('reload failed:', e);
 }
 
-// Optional: refresh the page so UI matches kiosk state
-setTimeout(() => location.reload(), 600);
+// Refresh the venue page
+setTimeout(() => location.reload(), 800);
+
 
 
           } catch (e) {
