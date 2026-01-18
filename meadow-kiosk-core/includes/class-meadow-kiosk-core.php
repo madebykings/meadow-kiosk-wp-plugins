@@ -358,6 +358,14 @@ class Meadow_Kiosk_Core {
             'callback' => [ $this, 'rest_vend_result' ],
             'permission_callback' => '__return_true',
         ] );
+
+        register_rest_route('meadow/v1', '/venue/restock', [
+            'methods'  => 'POST',
+            'callback' => [$this, 'rest_venue_restock'],
+            'permission_callback' => function () {
+            return is_user_logged_in();
+            },
+        ]);
     }
 
     /* ---------------------------------------------
@@ -653,6 +661,86 @@ public function rest_start_payment( WP_REST_Request $req ) {
     $order->add_product( $product, 1 );
     $order->set_currency( $currency );
     $order->calculate_totals();
+
+
+    /* ---------------------------------------------
+    * REST: restock
+     * ------------------------------------------- */
+
+    public function rest_venue_restock( WP_REST_Request $req ) {
+
+  $user = wp_get_current_user();
+  if ( ! $user || ! $user->ID ) {
+    return new WP_REST_Response([ 'ok' => false, 'error' => 'not_logged_in' ], 401);
+  }
+
+  // Optional role gate (recommended)
+  if ( ! in_array('venue', (array)$user->roles, true) ) {
+    return new WP_REST_Response([ 'ok' => false, 'error' => 'not_venue' ], 403);
+  }
+
+  $params  = $req->get_json_params();
+  $updates = $params['updates'] ?? null; // [{motor:2, stock:7}, ...]
+
+  if ( ! is_array($updates) || empty($updates) ) {
+    return new WP_REST_Response([ 'ok' => false, 'error' => 'missing_updates' ], 400);
+  }
+
+  // Find the kiosk post for this venue user
+  $q = new WP_Query([
+    'post_type'      => 'kiosk',
+    'posts_per_page' => 1,
+    'post_status'    => 'any',
+    'meta_key'       => '_meadow_venue_user_id',
+    'meta_value'     => (string)$user->ID,
+    'no_found_rows'  => true,
+  ]);
+
+  $kiosk_id = $q->posts[0]->ID ?? 0;
+  if ( ! $kiosk_id ) {
+    return new WP_REST_Response([ 'ok' => false, 'error' => 'kiosk_not_found' ], 404);
+  }
+
+  // Load the repeater (meta key: _meadow_kiosk_slots)
+  $slots = get_post_meta($kiosk_id, self::SLOT_REPEATER_META_KEY, true);
+  if ( ! is_array($slots) ) $slots = [];
+
+  // Map motor -> index in repeater
+  $motor_to_idx = [];
+  foreach ($slots as $idx => $row) {
+    $m = isset($row[self::SLOT_FIELD_MOTOR]) ? intval($row[self::SLOT_FIELD_MOTOR]) : 0;
+    if ($m > 0) $motor_to_idx[$m] = $idx;
+  }
+
+  $changed = [];
+  foreach ($updates as $u) {
+    $motor = isset($u['motor']) ? intval($u['motor']) : 0;
+    $stock = array_key_exists('stock', $u) ? intval($u['stock']) : null;
+
+    if ($motor <= 0 || $stock === null) continue;
+    if (!isset($motor_to_idx[$motor])) continue;
+
+    if ($stock < 0) $stock = 0;
+
+    $idx = $motor_to_idx[$motor];
+
+    // This is the field from your screenshot: name: _meadow_current_stock
+    $slots[$idx][ self::SLOT_FIELD_STOCK ] = $stock;
+
+    $changed[] = [ 'motor' => $motor, 'stock' => $stock ];
+  }
+
+  update_post_meta($kiosk_id, self::SLOT_REPEATER_META_KEY, $slots);
+
+  // Optional: bump config version to force refresh
+  update_post_meta($kiosk_id, '_meadow_config_version', time());
+
+  return new WP_REST_Response([
+    'ok'       => true,
+    'kiosk_id' => $kiosk_id,
+    'changed'  => $changed,
+  ], 200);
+}
 
     // -------------------------------------------------------
     // IMPORTANT: mark this as a KIOSK/VENDING order in Woo
