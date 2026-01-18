@@ -1,471 +1,915 @@
 <?php
 /**
- * Meadow Order Cleanup
- *
- * What it does:
- *  - Cancels stale on-hold WooCommerce kiosk orders (HPOS-safe)
- *  - Optionally marks stale meadow_payment posts as "abandoned" (does not touch orders)
- *  - Provides Tools -> Meadow Order Cleanup admin UI + hourly cron
- *
- * Safety:
- *  - Only touches orders with _meadow_order_type = 'kiosk'
- *  - Never cancels paid orders (date_paid or transaction_id present)
- *  - Default min age is conservative (20 minutes)
+ * Plugin Name: Meadow Kiosk – Order Cleanup
+ * Description: Cancels stale kiosk orders, trashes previously-cancelled kiosk orders after X days (no force delete), and optionally cleans up genuinely stuck meadow_payment posts. HPOS-safe. Includes Tools UI + hourly cron with locking.
+ * Version: 1.0.0
+ * Author: Meadow
  */
 
-if ( ! defined('ABSPATH') ) exit;
+if ( ! defined( 'ABSPATH' ) ) exit;
 
-if ( ! class_exists('Meadow_Order_Cleanup', false) ) {
+if ( ! class_exists( 'Meadow_Kiosk_Order_Cleanup' ) ) :
 
-  class Meadow_Order_Cleanup {
+final class Meadow_Kiosk_Order_Cleanup {
 
-    const CRON_HOOK = 'meadow_kiosk_order_cleanup_cron';
-    const CRON_SCHEDULE = 'hourly';
+	// ---- Assumptions / constants ----
+	const ORDER_TYPE_META_KEY           = '_meadow_order_type';
+	const ORDER_TYPE_KIOSK              = 'kiosk';
+	const CANCELLED_AT_META_KEY         = '_meadow_cleanup_cancelled_at';
+	const KIOSK_STATE_TABLE             = 'hhg_meadow_kiosk_state'; // explicit per your instruction
+	const PAYMENT_POST_TYPE             = 'meadow_payment';
 
-    const LOCK_TRANSIENT = 'meadow_kiosk_cleanup_lock';
-    const LOCK_TTL = 60;
+	// Cron + locking
+	const CRON_HOOK                     = 'meadow_kiosk_order_cleanup_hourly';
+	const LOCK_TRANSIENT_KEY            = 'meadow_kiosk_order_cleanup_lock';
+	const LOCK_TTL_SECONDS              = 55 * 60; // 55 minutes (hourly cron safety)
+	const DEFAULT_DRY_RUN               = true;
 
-    const LOG_OPTION = 'meadow_kiosk_cleanup_log';
-    const LOG_MAX = 250;
+	// Options
+	const OPT_KEY                       = 'meadow_kiosk_order_cleanup_options';
+	const OPT_VERSION                   = 1;
 
-    // Defaults
-    const DEFAULT_MIN_AGE_MINUTES = 20;
-    const DEFAULT_MAX_AGE_DAYS    = 14;
-    const DEFAULT_LIMIT           = 50;
+	// Admin UI
+	const ADMIN_PAGE_SLUG               = 'meadow-order-cleanup';
+	const ADMIN_NONCE_ACTION            = 'meadow_order_cleanup_run';
+	const ADMIN_NONCE_NAME              = 'meadow_order_cleanup_nonce';
 
-    // Order meta marker (this already exists in your flow)
-    const ORDER_META_ORDER_TYPE = '_meadow_order_type'; // = 'kiosk'
+	// Defaults (conservative)
+	private static function defaults() : array {
+		return [
+			'version' => self::OPT_VERSION,
 
-    // Helpful order meta keys (shown in notes / logs)
-    const ORDER_META_KIOSK_ID   = '_meadow_kiosk_id';
-    const ORDER_META_MOTOR      = '_meadow_motor';
-    const ORDER_META_REFERENCE  = '_meadow_reference';
-    const ORDER_META_SESSION_ID = '_meadow_session_id';
+			// Stage 1
+			'enable_stage1_cancel_stale' => 1,
+			'stage1_stale_minutes'       => 60,   // cancel kiosk orders on-hold/pending older than 60 minutes
+			'stage1_limit'               => 50,   // per run cap
 
-    // Optional: if you ever want to mark "cleaned"
-    const ORDER_META_CLEANED_AT = '_meadow_cleanup_cancelled_at';
-    const ORDER_META_CLEAN_NOTE = '_meadow_cleanup_cancel_note';
+			// Stage 2
+			'enable_stage2_trash_cancelled' => 1,
+			'stage2_trash_after_days'       => 14, // trash cancelled kiosk orders after 14 days since our cancelled-at tag
+			'stage2_limit'                  => 100,
 
-    // meadow_payment CPT (optional marking)
-    const PAY_POST_TYPE   = 'meadow_payment';
-    const PAY_META_STATUS = '_meadow_status';
-    const PAY_META_ORDER  = '_meadow_order_id';
-    const PAY_META_UPDATED_AT = '_meadow_updated_at';
+			// Payment cleanup (optional & conservative)
+			'enable_payment_cleanup'        => 0,
+			'payment_stuck_hours'           => 48,  // only consider *very* old payments
+			'payment_limit'                 => 50,
 
-    const PAY_META_CLEANED_AT   = '_meadow_cleaned_at';
-    const PAY_META_CLEANED_NOTE = '_meadow_clean_note';
+			// Safety
+			'dry_run_default'               => self::DEFAULT_DRY_RUN ? 1 : 0,
+		];
+	}
 
-    public static function init(): void {
-      static $did = false;
-      if ($did) return;
-      $did = true;
+	private static function get_opts() : array {
+		$opts = get_option( self::OPT_KEY, [] );
+		if ( ! is_array( $opts ) ) $opts = [];
+		return array_merge( self::defaults(), $opts );
+	}
 
-      add_action('init', [__CLASS__, 'schedule_cron']);
-      add_action(self::CRON_HOOK, [__CLASS__, 'run_cron']);
+	private static function update_opts( array $new ) : void {
+		$opts = array_merge( self::get_opts(), $new );
+		$opts['version'] = self::OPT_VERSION;
+		update_option( self::OPT_KEY, $opts, false );
+	}
 
-      if (is_admin()) {
-        add_action('admin_menu', [__CLASS__, 'admin_menu']);
-        add_action('admin_post_meadow_cleanup_run', [__CLASS__, 'handle_admin_run']);
-      }
-    }
+	// ---- Bootstrap ----
+	public static function init() : void {
+		add_action( 'admin_menu', [ __CLASS__, 'admin_menu' ] );
+		add_action( 'admin_post_meadow_order_cleanup_run', [ __CLASS__, 'handle_admin_post_run' ] );
 
-    /* -------------------- Cron -------------------- */
+		add_action( 'init', [ __CLASS__, 'ensure_cron_scheduled' ] );
+		add_action( self::CRON_HOOK, [ __CLASS__, 'cron_runner' ] );
 
-    public static function schedule_cron(): void {
-      if ( ! wp_next_scheduled(self::CRON_HOOK) ) {
-        wp_schedule_event(time() + 300, self::CRON_SCHEDULE, self::CRON_HOOK);
-      }
-    }
+		// If WooCommerce absent, we still render the Tools page and keep everything non-fatal.
+	}
 
-    public static function unschedule_cron(): void {
-      $ts = wp_next_scheduled(self::CRON_HOOK);
-      if ($ts) wp_unschedule_event($ts, self::CRON_HOOK);
-      wp_clear_scheduled_hook(self::CRON_HOOK);
-    }
+	// ---- Cron scheduling (hourly) ----
+	public static function ensure_cron_scheduled() : void {
+		if ( wp_doing_ajax() ) return;
 
-    public static function run_cron(): void {
-      self::run_cleanup([
-        'source' => 'cron',
-        'dry_run' => false,
-        'limit' => self::DEFAULT_LIMIT,
-        'min_age' => self::DEFAULT_MIN_AGE_MINUTES,
-        'max_age' => self::DEFAULT_MAX_AGE_DAYS,
-        'cancel_on_hold_orders' => true,
-        'mark_stale_payments' => true,
-        'user_id' => 0,
-      ]);
-    }
+		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
+			// Schedule to start in ~5 minutes to avoid stampede after deploy
+			wp_schedule_event( time() + 300, 'hourly', self::CRON_HOOK );
+		}
+	}
 
-    /* -------------------- Admin UI -------------------- */
+	// ---- Locking ----
+	private static function acquire_lock() : bool {
+		$existing = get_transient( self::LOCK_TRANSIENT_KEY );
+		if ( $existing ) return false;
+		set_transient( self::LOCK_TRANSIENT_KEY, 1, self::LOCK_TTL_SECONDS );
+		return true;
+	}
 
-    public static function admin_menu(): void {
-      add_management_page(
-        'Meadow Order Cleanup',
-        'Meadow Order Cleanup',
-        'manage_woocommerce',
-        'meadow-order-cleanup',
-        [__CLASS__, 'render_admin_page']
-      );
-    }
+	private static function release_lock() : void {
+		delete_transient( self::LOCK_TRANSIENT_KEY );
+	}
 
-    public static function render_admin_page(): void {
-      if ( ! current_user_can('manage_woocommerce') ) wp_die('Insufficient permissions.');
+	// ---- Admin UI ----
+	public static function admin_menu() : void {
+		add_management_page(
+			'Meadow Order Cleanup',
+			'Meadow Order Cleanup',
+			'manage_woocommerce',
+			self::ADMIN_PAGE_SLUG,
+			[ __CLASS__, 'render_tools_page' ]
+		);
+	}
 
-      $log = get_option(self::LOG_OPTION, []);
-      if ( ! is_array($log) ) $log = [];
+	public static function render_tools_page() : void {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_die( 'Insufficient permissions.' );
+		}
 
-      $nonce = wp_create_nonce('meadow_cleanup_run');
+		$opts = self::get_opts();
+		$dry_run = isset( $_GET['dry_run'] ) ? (int) $_GET['dry_run'] : (int) $opts['dry_run_default'];
 
-      $ran = isset($_GET['ran']) ? (int)$_GET['ran'] : 0;
-      if ($ran) {
-        $dry = !empty($_GET['dry']);
-        $msg = sprintf(
-          'Last run: dry_run=%s | order_candidates=%s order_actions=%s | pay_candidates=%s pay_actions=%s',
-          $dry ? 'true' : 'false',
-          isset($_GET['oc']) ? (int)$_GET['oc'] : 0,
-          isset($_GET['oa']) ? (int)$_GET['oa'] : 0,
-          isset($_GET['pc']) ? (int)$_GET['pc'] : 0,
-          isset($_GET['pa']) ? (int)$_GET['pa'] : 0
-        );
-        echo '<div class="notice notice-success"><p>' . esc_html($msg) . '</p></div>';
-      }
+		// Pre-calc counters (non-fatal)
+		$counters = self::get_counters( [
+			'stage1_stale_minutes' => (int) $opts['stage1_stale_minutes'],
+			'stage2_trash_after_days' => (int) $opts['stage2_trash_after_days'],
+			'payment_stuck_hours' => (int) $opts['payment_stuck_hours'],
+		] );
 
-      echo '<div class="wrap">';
-      echo '<h1>Meadow Order Cleanup</h1>';
-      echo '<p>Cancels stale <strong>on-hold kiosk orders</strong> (safe: kiosk-only + unpaid-only). Optionally marks stale meadow_payment posts as abandoned.</p>';
+		$last_result = get_transient( 'meadow_kiosk_order_cleanup_last_result' );
+		if ( ! is_array( $last_result ) ) $last_result = null;
 
-      echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
-      echo '<input type="hidden" name="action" value="meadow_cleanup_run">';
-      echo '<input type="hidden" name="_wpnonce" value="' . esc_attr($nonce) . '">';
+		?>
+		<div class="wrap">
+			<h1>Meadow Order Cleanup</h1>
 
-      echo '<p><label><input type="checkbox" name="dry_run" value="1" checked> Dry run (preview only)</label></p>';
-      echo '<p><label><input type="checkbox" name="cancel_on_hold_orders" value="1" checked> Cancel stale on-hold kiosk orders</label></p>';
-      echo '<p><label><input type="checkbox" name="mark_stale_payments" value="1" checked> Mark stale meadow_payment posts as abandoned</label></p>';
+			<?php if ( $last_result ) : ?>
+				<div class="notice notice-<?php echo esc_attr( $last_result['ok'] ? 'success' : 'warning' ); ?>">
+					<p><strong>Last run:</strong> <?php echo esc_html( $last_result['when'] ); ?> —
+						<?php echo esc_html( $last_result['summary'] ); ?>
+					</p>
+					<?php if ( ! empty( $last_result['notes'] ) ) : ?>
+						<details>
+							<summary>Details</summary>
+							<pre style="white-space:pre-wrap;"><?php echo esc_html( implode( "\n", $last_result['notes'] ) ); ?></pre>
+						</details>
+					<?php endif; ?>
+				</div>
+			<?php endif; ?>
 
-      echo '<p><label>Limit <input type="number" name="limit" value="' . esc_attr(self::DEFAULT_LIMIT) . '" min="1" max="500"></label></p>';
-      echo '<p><label>Minimum age (minutes) <input type="number" name="min_age" value="' . esc_attr(self::DEFAULT_MIN_AGE_MINUTES) . '" min="1" max="1440"></label></p>';
-      echo '<p><label>Max age (days) <input type="number" name="max_age" value="' . esc_attr(self::DEFAULT_MAX_AGE_DAYS) . '" min="1" max="365"></label></p>';
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+				<?php wp_nonce_field( self::ADMIN_NONCE_ACTION, self::ADMIN_NONCE_NAME ); ?>
+				<input type="hidden" name="action" value="meadow_order_cleanup_run" />
 
-      submit_button('Run Cleanup');
-      echo '</form>';
+				<table class="form-table" role="presentation">
+					<tbody>
+						<tr>
+							<th scope="row">Dry run</th>
+							<td>
+								<label>
+									<input type="checkbox" name="dry_run" value="1" <?php checked( 1, $dry_run ); ?> />
+									Do not change anything; only report what would happen.
+								</label>
+							</td>
+						</tr>
 
-      echo '<h2>Recent Log</h2>';
-      if (empty($log)) {
-        echo '<p>No log entries yet.</p>';
-      } else {
-        echo '<table class="widefat striped"><thead><tr><th style="width:220px;">Time (UTC)</th><th style="width:90px;">Source</th><th>Summary</th></tr></thead><tbody>';
-        foreach (array_reverse($log) as $row) {
-          $t = esc_html($row['time'] ?? '');
-          $s = esc_html($row['source'] ?? '');
-          $m = esc_html($row['message'] ?? '');
-          echo "<tr><td>{$t}</td><td>{$s}</td><td>{$m}</td></tr>";
-        }
-        echo '</tbody></table>';
-      }
+						<tr>
+							<th scope="row">Stage 1: Cancel stale kiosk orders</th>
+							<td>
+								<label>
+									<input type="checkbox" name="enable_stage1_cancel_stale" value="1" <?php checked( 1, (int) $opts['enable_stage1_cancel_stale'] ); ?> />
+									Enable
+								</label>
+								<p class="description">
+									Cancels kiosk-only orders that are <code>on-hold</code> or <code>pending</code>, unpaid, and older than the threshold.
+									HPOS-safe. Adds <code><?php echo esc_html( self::CANCELLED_AT_META_KEY ); ?></code>.
+								</p>
+								<p>
+									Stale threshold:
+									<input type="number" min="5" step="1" name="stage1_stale_minutes" value="<?php echo esc_attr( (int) $opts['stage1_stale_minutes'] ); ?>" />
+									minutes
+									&nbsp;|&nbsp; Max per run:
+									<input type="number" min="1" step="1" name="stage1_limit" value="<?php echo esc_attr( (int) $opts['stage1_limit'] ); ?>" />
+								</p>
+								<p><strong>Current eligible count (estimate):</strong> <?php echo esc_html( (string) $counters['stage1'] ); ?></p>
+							</td>
+						</tr>
 
-      echo '</div>';
-    }
+						<tr>
+							<th scope="row">Stage 2: Trash previously-cancelled kiosk orders</th>
+							<td>
+								<label>
+									<input type="checkbox" name="enable_stage2_trash_cancelled" value="1" <?php checked( 1, (int) $opts['enable_stage2_trash_cancelled'] ); ?> />
+									Enable
+								</label>
+								<p class="description">
+									Only orders with <code>status=cancelled</code> and a prior
+									<code><?php echo esc_html( self::CANCELLED_AT_META_KEY ); ?></code> older than the threshold are moved to trash.
+									<strong>Not force-deleted.</strong>
+								</p>
+								<p>
+									Trash after:
+									<input type="number" min="1" step="1" name="stage2_trash_after_days" value="<?php echo esc_attr( (int) $opts['stage2_trash_after_days'] ); ?>" />
+									days
+									&nbsp;|&nbsp; Max per run:
+									<input type="number" min="1" step="1" name="stage2_limit" value="<?php echo esc_attr( (int) $opts['stage2_limit'] ); ?>" />
+								</p>
+								<p><strong>Current eligible count (estimate):</strong> <?php echo esc_html( (string) $counters['stage2'] ); ?></p>
+							</td>
+						</tr>
 
-    public static function handle_admin_run(): void {
-      if ( ! current_user_can('manage_woocommerce') ) wp_die('Insufficient permissions.');
-      check_admin_referer('meadow_cleanup_run');
+						<tr>
+							<th scope="row">Payment cleanup (optional, conservative)</th>
+							<td>
+								<label>
+									<input type="checkbox" name="enable_payment_cleanup" value="1" <?php checked( 1, (int) $opts['enable_payment_cleanup'] ); ?> />
+									Enable
+								</label>
+								<p class="description">
+									Only touches <code><?php echo esc_html( self::PAYMENT_POST_TYPE ); ?></code> posts that look genuinely stuck and not referenced as active by <code><?php echo esc_html( self::KIOSK_STATE_TABLE ); ?></code>.
+									This is deliberately conservative; if it can’t prove “stuck”, it skips.
+								</p>
+								<p>
+									Consider “stuck” if older than:
+									<input type="number" min="12" step="1" name="payment_stuck_hours" value="<?php echo esc_attr( (int) $opts['payment_stuck_hours'] ); ?>" />
+									hours
+									&nbsp;|&nbsp; Max per run:
+									<input type="number" min="1" step="1" name="payment_limit" value="<?php echo esc_attr( (int) $opts['payment_limit'] ); ?>" />
+								</p>
+								<p><strong>Current eligible count (estimate):</strong> <?php echo esc_html( (string) $counters['payment'] ); ?></p>
+							</td>
+						</tr>
+					</tbody>
+				</table>
 
-      $dry_run  = ! empty($_POST['dry_run']);
-      $limit    = isset($_POST['limit']) ? max(1, min(500, (int)$_POST['limit'])) : self::DEFAULT_LIMIT;
-      $min_age  = isset($_POST['min_age']) ? max(1, min(1440, (int)$_POST['min_age'])) : self::DEFAULT_MIN_AGE_MINUTES;
-      $max_age  = isset($_POST['max_age']) ? max(1, min(365, (int)$_POST['max_age'])) : self::DEFAULT_MAX_AGE_DAYS;
+				<?php submit_button( 'Run Cleanup Now' ); ?>
+			</form>
 
-      $cancel_orders = ! empty($_POST['cancel_on_hold_orders']);
-      $mark_payments = ! empty($_POST['mark_stale_payments']);
+			<hr />
 
-      $res = self::run_cleanup([
-        'source' => 'admin',
-        'dry_run' => $dry_run,
-        'limit' => $limit,
-        'min_age' => $min_age,
-        'max_age' => $max_age,
-        'cancel_on_hold_orders' => $cancel_orders,
-        'mark_stale_payments' => $mark_payments,
-        'user_id' => get_current_user_id(),
-      ]);
+			<h2>Safety Notes</h2>
+			<ul>
+				<li><strong>Kiosk-only:</strong> Orders must have meta <code><?php echo esc_html( self::ORDER_TYPE_META_KEY ); ?></code> = <code><?php echo esc_html( self::ORDER_TYPE_KIOSK ); ?></code>.</li>
+				<li><strong>Unpaid-only:</strong> Stage 1 skips any paid order (even if status is odd).</li>
+				<li><strong>Never fatal:</strong> Exceptions are caught and logged; cleanup continues.</li>
+				<li><strong>Cron:</strong> Hourly with a lock; no double-runs.</li>
+			</ul>
+		</div>
+		<?php
+	}
 
-      wp_safe_redirect(add_query_arg([
-        'page' => 'meadow-order-cleanup',
-        'ran'  => 1,
-        'dry'  => $dry_run ? 1 : 0,
-        'oc'   => $res['order_candidates'] ?? 0,
-        'oa'   => $res['order_actions'] ?? 0,
-        'pc'   => $res['pay_candidates'] ?? 0,
-        'pa'   => $res['pay_actions'] ?? 0,
-      ], admin_url('tools.php')));
-      exit;
-    }
+	public static function handle_admin_post_run() : void {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_die( 'Insufficient permissions.' );
+		}
+		check_admin_referer( self::ADMIN_NONCE_ACTION, self::ADMIN_NONCE_NAME );
 
-    /* -------------------- Core -------------------- */
+		$opts = self::get_opts();
 
-    public static function run_cleanup(array $args): array {
-      // Basic lock to avoid double-runs
-      if ( get_transient(self::LOCK_TRANSIENT) ) {
-        self::log((string)($args['source'] ?? 'unknown'), 'Skipped (lock present).');
-        return ['skipped' => true];
-      }
-      set_transient(self::LOCK_TRANSIENT, 1, self::LOCK_TTL);
+		// Update saved options from form (checkboxes + numbers)
+		$new = [
+			'enable_stage1_cancel_stale'   => isset( $_POST['enable_stage1_cancel_stale'] ) ? 1 : 0,
+			'stage1_stale_minutes'         => max( 5, (int) ( $_POST['stage1_stale_minutes'] ?? $opts['stage1_stale_minutes'] ) ),
+			'stage1_limit'                 => max( 1, (int) ( $_POST['stage1_limit'] ?? $opts['stage1_limit'] ) ),
 
-      $source = (string)($args['source'] ?? 'unknown');
-      $dry_run = (bool)($args['dry_run'] ?? true);
-      $limit = (int)($args['limit'] ?? self::DEFAULT_LIMIT);
-      $min_age = (int)($args['min_age'] ?? self::DEFAULT_MIN_AGE_MINUTES);
-      $max_age = (int)($args['max_age'] ?? self::DEFAULT_MAX_AGE_DAYS);
-      $user_id = (int)($args['user_id'] ?? 0);
+			'enable_stage2_trash_cancelled'=> isset( $_POST['enable_stage2_trash_cancelled'] ) ? 1 : 0,
+			'stage2_trash_after_days'      => max( 1, (int) ( $_POST['stage2_trash_after_days'] ?? $opts['stage2_trash_after_days'] ) ),
+			'stage2_limit'                 => max( 1, (int) ( $_POST['stage2_limit'] ?? $opts['stage2_limit'] ) ),
 
-      $cancel_orders = (bool)($args['cancel_on_hold_orders'] ?? true);
-      $mark_payments = (bool)($args['mark_stale_payments'] ?? true);
+			'enable_payment_cleanup'       => isset( $_POST['enable_payment_cleanup'] ) ? 1 : 0,
+			'payment_stuck_hours'          => max( 12, (int) ( $_POST['payment_stuck_hours'] ?? $opts['payment_stuck_hours'] ) ),
+			'payment_limit'                => max( 1, (int) ( $_POST['payment_limit'] ?? $opts['payment_limit'] ) ),
+		];
+		self::update_opts( $new );
 
-      $order_candidates = 0;
-      $order_actions = 0;
-      $pay_candidates = 0;
-      $pay_actions = 0;
+		$dry_run = isset( $_POST['dry_run'] ) ? 1 : 0;
 
-      try {
-        $now = time();
-        $min_ts = $now - ($min_age * 60);
-        $max_ts = $now - ($max_age * 86400);
+		$result = self::run_cleanup( [
+			'context' => 'admin',
+			'dry_run' => (bool) $dry_run,
+			'opts'    => self::get_opts(),
+		] );
 
-        // A) Cancel stale on-hold kiosk orders
-        if ($cancel_orders) {
-          $orders = self::find_stale_on_hold_kiosk_orders($min_ts, $max_ts, $limit);
-          $order_candidates = count($orders);
+		set_transient( 'meadow_kiosk_order_cleanup_last_result', $result, 6 * HOUR_IN_SECONDS );
 
-          foreach ($orders as $order) {
-            if (self::cancel_order_if_safe($order, $dry_run, $user_id)) {
-              $order_actions++;
-            }
-          }
-        }
+		wp_safe_redirect( admin_url( 'tools.php?page=' . self::ADMIN_PAGE_SLUG . '&dry_run=' . ( $dry_run ? '1' : '0' ) ) );
+		exit;
+	}
 
-        // B) Mark stale meadow_payment posts as abandoned (optional)
-        if ($mark_payments) {
-          $pays = self::find_stale_payment_posts($min_ts, $max_ts, $limit);
-          $pay_candidates = count($pays);
+	// ---- Cron runner ----
+	public static function cron_runner() : void {
+		// Keep cron runs conservative: use saved opts and default dry-run setting (usually false for cron).
+		$opts = self::get_opts();
+		$dry_run = false; // cron should actually clean, otherwise it does nothing forever
 
-          foreach ($pays as $p) {
-            if (self::mark_payment_post_abandoned((int)$p->ID, $dry_run)) {
-              $pay_actions++;
-            }
-          }
-        }
+		$result = self::run_cleanup( [
+			'context' => 'cron',
+			'dry_run' => $dry_run,
+			'opts'    => $opts,
+		] );
 
-        self::log($source, sprintf(
-          'Run complete. dry_run=%s orders(candidates=%d actions=%d) payments(candidates=%d actions=%d) min_age=%dm max_age=%dd limit=%d',
-          $dry_run ? 'true' : 'false',
-          $order_candidates, $order_actions,
-          $pay_candidates, $pay_actions,
-          $min_age, $max_age, $limit
-        ));
+		// Store last result for visibility in Tools page
+		set_transient( 'meadow_kiosk_order_cleanup_last_result', $result, 6 * HOUR_IN_SECONDS );
+	}
 
-        return [
-          'dry_run' => $dry_run,
-          'order_candidates' => $order_candidates,
-          'order_actions' => $order_actions,
-          'pay_candidates' => $pay_candidates,
-          'pay_actions' => $pay_actions,
-        ];
+	// ---- Main cleanup orchestrator ----
+	private static function run_cleanup( array $args ) : array {
+		$context = (string) ( $args['context'] ?? 'unknown' );
+		$dry_run = (bool) ( $args['dry_run'] ?? self::DEFAULT_DRY_RUN );
+		$opts    = (array) ( $args['opts'] ?? self::get_opts() );
 
-      } finally {
-        delete_transient(self::LOCK_TRANSIENT);
-      }
-    }
+		$notes = [];
+		$ok = true;
 
-    /* -------------------- Orders cleanup -------------------- */
+		$started = gmdate( 'c' );
 
-/**
- * Find stale on-hold kiosk orders within (max_age .. min_age) window.
- * HPOS-safe: use Woo date range string (NOT an array).
- */
-private static function find_stale_on_hold_kiosk_orders(int $min_ts, int $max_ts, int $limit): array {
-  if ( ! function_exists('wc_get_orders') ) return [];
+		if ( ! self::acquire_lock() ) {
+			return [
+				'ok'      => true,
+				'when'    => $started,
+				'summary' => "Skipped ($context): another cleanup run is in progress (lock held).",
+				'notes'   => [ 'Lock was already set; no action taken.' ],
+			];
+		}
 
-  // Want orders created between max_ts and min_ts (older than min_age, newer than max_age).
-  $after  = gmdate('Y-m-d H:i:s', $max_ts);
-  $before = gmdate('Y-m-d H:i:s', $min_ts);
+		try {
+			// If WooCommerce is missing, we still exit cleanly.
+			if ( ! function_exists( 'wc_get_orders' ) ) {
+				$ok = false;
+				$notes[] = 'WooCommerce functions not available (wc_get_orders missing). Skipping order cleanup safely.';
+				return [
+					'ok'      => $ok,
+					'when'    => $started,
+					'summary' => "Completed ($context): WooCommerce not available; nothing done.",
+					'notes'   => $notes,
+				];
+			}
 
-  // ✅ Woo range string format (HPOS-safe)
-  $date_range = $after . '...' . $before;
+			// STAGE 1
+			$stage1_done = 0;
+			$stage1_skipped = 0;
+			$stage1_seen = 0;
 
-  try {
-    $orders = wc_get_orders([
-      'limit'        => $limit,
-      'status'       => ['on-hold'],
-      'orderby'      => 'date',
-      'order'        => 'ASC',
-      'date_created' => $date_range,
-      'meta_query'   => [
-        [
-          'key'     => self::ORDER_META_ORDER_TYPE,
-          'value'   => 'kiosk',
-          'compare' => '=',
-        ],
-      ],
-    ]);
+			if ( ! empty( $opts['enable_stage1_cancel_stale'] ) ) {
+				$r = self::stage1_cancel_stale_kiosk_orders( [
+					'dry_run'            => $dry_run,
+					'stale_minutes'      => (int) $opts['stage1_stale_minutes'],
+					'limit'              => (int) $opts['stage1_limit'],
+				] );
+				$stage1_done    = (int) $r['done'];
+				$stage1_skipped = (int) $r['skipped'];
+				$stage1_seen    = (int) $r['seen'];
+				$notes = array_merge( $notes, $r['notes'] );
+			} else {
+				$notes[] = 'Stage 1 disabled.';
+			}
 
-    return is_array($orders) ? $orders : [];
-  } catch (\Throwable $e) {
-    self::log('order-cleanup', 'wc_get_orders failed: ' . $e->getMessage());
-    return [];
-  }
+			// STAGE 2
+			$stage2_done = 0;
+			$stage2_skipped = 0;
+			$stage2_seen = 0;
+
+			if ( ! empty( $opts['enable_stage2_trash_cancelled'] ) ) {
+				$r = self::stage2_trash_old_cancelled_kiosk_orders( [
+					'dry_run'        => $dry_run,
+					'after_days'     => (int) $opts['stage2_trash_after_days'],
+					'limit'          => (int) $opts['stage2_limit'],
+				] );
+				$stage2_done    = (int) $r['done'];
+				$stage2_skipped = (int) $r['skipped'];
+				$stage2_seen    = (int) $r['seen'];
+				$notes = array_merge( $notes, $r['notes'] );
+			} else {
+				$notes[] = 'Stage 2 disabled.';
+			}
+
+			// PAYMENT CLEANUP (optional)
+			$pay_done = 0;
+			$pay_skipped = 0;
+			$pay_seen = 0;
+
+			if ( ! empty( $opts['enable_payment_cleanup'] ) ) {
+				$r = self::payment_cleanup_conservative( [
+					'dry_run'     => $dry_run,
+					'stuck_hours' => (int) $opts['payment_stuck_hours'],
+					'limit'       => (int) $opts['payment_limit'],
+				] );
+				$pay_done    = (int) $r['done'];
+				$pay_skipped = (int) $r['skipped'];
+				$pay_seen    = (int) $r['seen'];
+				$notes = array_merge( $notes, $r['notes'] );
+			} else {
+				$notes[] = 'Payment cleanup disabled.';
+			}
+
+			$summary = sprintf(
+				"Completed (%s)%s. Stage1: %d/%d cancelled (skipped %d). Stage2: %d/%d trashed (skipped %d). Payments: %d/%d cleaned (skipped %d).",
+				$context,
+				$dry_run ? ' [DRY RUN]' : '',
+				$stage1_done, $stage1_seen, $stage1_skipped,
+				$stage2_done, $stage2_seen, $stage2_skipped,
+				$pay_done, $pay_seen, $pay_skipped
+			);
+
+			return [
+				'ok'      => $ok,
+				'when'    => $started,
+				'summary' => $summary,
+				'notes'   => $notes,
+			];
+
+		} catch ( \Throwable $e ) {
+			$ok = false;
+			$notes[] = 'Fatal caught (non-fatal to site): ' . $e->getMessage();
+			self::log( 'Cleanup exception: ' . $e->getMessage() );
+
+			return [
+				'ok'      => $ok,
+				'when'    => $started,
+				'summary' => "Completed ($context) with errors" . ( $dry_run ? ' [DRY RUN]' : '' ) . ".",
+				'notes'   => $notes,
+			];
+		} finally {
+			self::release_lock();
+		}
+	}
+
+	// ---- Stage 1: cancel stale on-hold/pending kiosk orders (HPOS-safe) ----
+	private static function stage1_cancel_stale_kiosk_orders( array $args ) : array {
+		$dry_run       = (bool) ( $args['dry_run'] ?? self::DEFAULT_DRY_RUN );
+		$stale_minutes = max( 5, (int) ( $args['stale_minutes'] ?? 60 ) );
+		$limit         = max( 1, (int) ( $args['limit'] ?? 50 ) );
+
+		$notes = [];
+		$done = 0; $skipped = 0; $seen = 0;
+
+		$cutoff_ts = time() - ( $stale_minutes * 60 );
+		$cutoff_gmt = gmdate( 'Y-m-d H:i:s', $cutoff_ts );
+
+		// Only kiosk orders (meta), unpaid, and in pending/on-hold older than cutoff.
+		// HPOS-safe: wc_get_orders uses WooCommerce data store.
+		$query_args = [
+			'status'         => [ 'on-hold', 'pending' ],
+			'limit'          => $limit,
+			'orderby'        => 'date_created',
+			'order'          => 'ASC',
+			'date_created'   => '<' . $cutoff_gmt,
+			'meta_query'     => [
+				[
+					'key'     => self::ORDER_TYPE_META_KEY,
+					'value'   => self::ORDER_TYPE_KIOSK,
+					'compare' => '=',
+				],
+			],
+			'return'         => 'objects',
+		];
+
+		$orders = [];
+		try {
+			$orders = wc_get_orders( $query_args );
+		} catch ( \Throwable $e ) {
+			self::log( 'Stage1 wc_get_orders failed: ' . $e->getMessage() );
+			$notes[] = 'Stage 1 query failed (caught): ' . $e->getMessage();
+			return compact( 'done', 'skipped', 'seen', 'notes' );
+		}
+
+		foreach ( $orders as $order ) {
+			$seen++;
+
+			try {
+				if ( ! $order || ! is_a( $order, 'WC_Order' ) ) { $skipped++; continue; }
+
+				// Safety: kiosk-only meta check again
+				$otype = (string) $order->get_meta( self::ORDER_TYPE_META_KEY, true );
+				if ( $otype !== self::ORDER_TYPE_KIOSK ) { $skipped++; continue; }
+
+				// Safety: unpaid-only
+				if ( method_exists( $order, 'is_paid' ) && $order->is_paid() ) {
+					$skipped++;
+					continue;
+				}
+
+				// If it was already cancelled and tagged, skip (idempotency)
+				$already = (string) $order->get_meta( self::CANCELLED_AT_META_KEY, true );
+				if ( $already !== '' ) { $skipped++; continue; }
+
+				$order_id = $order->get_id();
+
+				if ( $dry_run ) {
+					$done++;
+					$notes[] = "Stage1 DRY: would cancel order #{$order_id} (status={$order->get_status()}, created={$order->get_date_created()}).";
+					continue;
+				}
+
+				// Cancel
+				$order->update_status( 'cancelled', sprintf( 'Meadow cleanup: stale kiosk order (> %d min).', $stale_minutes ), true );
+				$order->update_meta_data( self::CANCELLED_AT_META_KEY, gmdate( 'c' ) );
+				$order->save();
+
+				$done++;
+				$notes[] = "Stage1: cancelled order #{$order_id} and tagged " . self::CANCELLED_AT_META_KEY . ".";
+			} catch ( \Throwable $e ) {
+				$skipped++;
+				self::log( 'Stage1 order error: ' . $e->getMessage() );
+				$notes[] = 'Stage1 caught error: ' . $e->getMessage();
+				continue;
+			}
+		}
+
+		return compact( 'done', 'skipped', 'seen', 'notes' );
+	}
+
+	// ---- Stage 2: trash previously-cancelled kiosk orders after X days (no force delete) ----
+	private static function stage2_trash_old_cancelled_kiosk_orders( array $args ) : array {
+		$dry_run    = (bool) ( $args['dry_run'] ?? self::DEFAULT_DRY_RUN );
+		$after_days = max( 1, (int) ( $args['after_days'] ?? 14 ) );
+		$limit      = max( 1, (int) ( $args['limit'] ?? 100 ) );
+
+		$notes = [];
+		$done = 0; $skipped = 0; $seen = 0;
+
+		$cutoff_ts = time() - ( $after_days * DAY_IN_SECONDS );
+		$cutoff_iso = gmdate( 'c', $cutoff_ts );
+
+		// We only want orders:
+		// - status cancelled
+		// - kiosk meta
+		// - have our cancelled_at meta older than cutoff
+		// Note: meta values are ISO strings; we use compare by string. ISO 8601 sorts lexicographically.
+		$query_args = [
+			'status'     => [ 'cancelled' ],
+			'limit'      => $limit,
+			'orderby'    => 'date_modified',
+			'order'      => 'ASC',
+			'meta_query' => [
+				[
+					'key'     => self::ORDER_TYPE_META_KEY,
+					'value'   => self::ORDER_TYPE_KIOSK,
+					'compare' => '=',
+				],
+				[
+					'key'     => self::CANCELLED_AT_META_KEY,
+					'value'   => $cutoff_iso,
+					'compare' => '<=',
+				],
+			],
+			'return'     => 'objects',
+		];
+
+		$orders = [];
+		try {
+			$orders = wc_get_orders( $query_args );
+		} catch ( \Throwable $e ) {
+			self::log( 'Stage2 wc_get_orders failed: ' . $e->getMessage() );
+			$notes[] = 'Stage 2 query failed (caught): ' . $e->getMessage();
+			return compact( 'done', 'skipped', 'seen', 'notes' );
+		}
+
+		foreach ( $orders as $order ) {
+			$seen++;
+
+			try {
+				if ( ! $order || ! is_a( $order, 'WC_Order' ) ) { $skipped++; continue; }
+
+				$otype = (string) $order->get_meta( self::ORDER_TYPE_META_KEY, true );
+				if ( $otype !== self::ORDER_TYPE_KIOSK ) { $skipped++; continue; }
+
+				$cancelled_at = (string) $order->get_meta( self::CANCELLED_AT_META_KEY, true );
+				if ( $cancelled_at === '' ) { $skipped++; continue; }
+
+				$order_id = $order->get_id();
+
+				// If already trashed, skip.
+				// HPOS still has underlying post status; wc_get_orders generally won't return trashed.
+				// But we remain defensive:
+				$post_status = function_exists( 'get_post_status' ) ? get_post_status( $order_id ) : '';
+				if ( $post_status === 'trash' ) { $skipped++; continue; }
+
+				if ( $dry_run ) {
+					$done++;
+					$notes[] = "Stage2 DRY: would trash cancelled kiosk order #{$order_id} (cancelled_at={$cancelled_at}).";
+					continue;
+				}
+
+				// Move to trash (NOT force delete)
+				if ( function_exists( 'wc_trash_order' ) ) {
+					wc_trash_order( $order_id );
+				} else {
+					// Fallback: trash underlying post id (safe, not force delete)
+					wp_trash_post( $order_id );
+				}
+
+				$done++;
+				$notes[] = "Stage2: trashed order #{$order_id} (not force deleted).";
+			} catch ( \Throwable $e ) {
+				$skipped++;
+				self::log( 'Stage2 order error: ' . $e->getMessage() );
+				$notes[] = 'Stage2 caught error: ' . $e->getMessage();
+				continue;
+			}
+		}
+
+		return compact( 'done', 'skipped', 'seen', 'notes' );
+	}
+
+	// ---- Payment cleanup: optional + conservative (only genuinely stuck meadow_payment posts) ----
+	private static function payment_cleanup_conservative( array $args ) : array {
+		global $wpdb;
+
+		$dry_run    = (bool) ( $args['dry_run'] ?? self::DEFAULT_DRY_RUN );
+		$stuck_hours= max( 12, (int) ( $args['stuck_hours'] ?? 48 ) );
+		$limit      = max( 1, (int) ( $args['limit'] ?? 50 ) );
+
+		$notes = [];
+		$done = 0; $skipped = 0; $seen = 0;
+
+		// Conservative definition of "stuck":
+		// - meadow_payment post type
+		// - older than stuck_hours
+		// - NOT in trash
+		// - NOT referenced as active by kiosk_state table (if we can infer active references)
+		//
+		// Action: move payment post to trash (NOT force delete).
+		// Rationale: safest cleanup step; doesn’t delete data.
+
+		$cutoff_ts = time() - ( $stuck_hours * HOUR_IN_SECONDS );
+
+		$active = self::infer_active_kiosk_references( $cutoff_ts );
+		$active_order_ids   = $active['order_ids'];    // ints
+		$active_session_ids = $active['session_ids'];  // strings
+
+		// Query candidates
+		$q = new WP_Query( [
+			'post_type'              => self::PAYMENT_POST_TYPE,
+			'post_status'            => [ 'publish', 'pending', 'draft', 'private' ],
+			'posts_per_page'         => $limit,
+			'orderby'                => 'date',
+			'order'                  => 'ASC',
+			'date_query'             => [
+				[
+					'before' => gmdate( 'Y-m-d H:i:s', $cutoff_ts ),
+					'inclusive' => true,
+				]
+			],
+			'fields'                 => 'ids',
+			'no_found_rows'          => true,
+			'update_post_meta_cache' => true,
+			'update_post_term_cache' => false,
+		] );
+
+		$ids = is_array( $q->posts ) ? $q->posts : [];
+
+		foreach ( $ids as $pid ) {
+			$seen++;
+
+			try {
+				$pid = (int) $pid;
+				if ( $pid <= 0 ) { $skipped++; continue; }
+
+				// Never touch if already trashed
+				if ( get_post_status( $pid ) === 'trash' ) { $skipped++; continue; }
+
+				// Extremely conservative skip rules:
+				// If we can detect it’s tied to an active kiosk state (order/session), skip.
+				$meta_order_id   = get_post_meta( $pid, '_meadow_order_id', true );
+				$meta_session_id = get_post_meta( $pid, '_meadow_session_id', true );
+
+				if ( $meta_order_id !== '' ) {
+					$oid = (int) $meta_order_id;
+					if ( $oid > 0 && in_array( $oid, $active_order_ids, true ) ) {
+						$skipped++;
+						continue;
+					}
+				}
+				if ( is_string( $meta_session_id ) && $meta_session_id !== '' ) {
+					if ( in_array( $meta_session_id, $active_session_ids, true ) ) {
+						$skipped++;
+						continue;
+					}
+				}
+
+				// Also skip if it looks “final” by common meta flags (if present).
+				// We do NOT require these metas to exist; we only use them to safely skip.
+				$maybe_final_keys = [ '_meadow_payment_final', '_meadow_is_final', '_meadow_final', '_meadow_status' ];
+				foreach ( $maybe_final_keys as $k ) {
+					$v = get_post_meta( $pid, $k, true );
+					if ( $k === '_meadow_status' && is_string( $v ) ) {
+						$sv = strtolower( trim( $v ) );
+						if ( in_array( $sv, [ 'paid', 'approved', 'completed', 'cancelled', 'declined', 'failed', 'refunded' ], true ) ) {
+							$skipped++;
+							continue 2;
+						}
+					}
+					if ( $v === '1' || $v === 1 || $v === true || $v === 'true' ) {
+						$skipped++;
+						continue 2;
+					}
+				}
+
+				if ( $dry_run ) {
+					$done++;
+					$notes[] = "Payment DRY: would trash meadow_payment #{$pid} (older than {$stuck_hours}h; not referenced as active).";
+					continue;
+				}
+
+				wp_trash_post( $pid );
+				$done++;
+				$notes[] = "Payment: trashed meadow_payment #{$pid} (not force deleted).";
+
+			} catch ( \Throwable $e ) {
+				$skipped++;
+				self::log( 'Payment cleanup error: ' . $e->getMessage() );
+				$notes[] = 'Payment cleanup caught error: ' . $e->getMessage();
+				continue;
+			}
+		}
+
+		return compact( 'done', 'skipped', 'seen', 'notes' );
+	}
+
+	/**
+	 * Infer “active” kiosk references from hhg_meadow_kiosk_state.
+	 * We avoid assuming exact schema; we probe columns and only use those that exist.
+	 *
+	 * Returns:
+	 *  [
+	 *    'order_ids'   => int[],
+	 *    'session_ids' => string[],
+	 *  ]
+	 */
+	private static function infer_active_kiosk_references( int $active_cutoff_ts ) : array {
+		global $wpdb;
+
+		$order_ids   = [];
+		$session_ids = [];
+
+		$table = self::KIOSK_STATE_TABLE;
+		// If table name is not prefixed, use as-is per instruction.
+		// But also attempt prefixed variant as a fallback without breaking anything.
+		$candidates = [ $table, $wpdb->prefix . ltrim( $table, $wpdb->prefix ) ];
+
+		$found_table = null;
+		foreach ( $candidates as $t ) {
+			$exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $t ) );
+			if ( $exists ) { $found_table = $t; break; }
+		}
+		if ( ! $found_table ) {
+			// Table missing; return empty (most conservative: do not “prove active”, but still conservative via meta checks)
+			return [ 'order_ids' => [], 'session_ids' => [] ];
+		}
+
+		$cols = $wpdb->get_col( "SHOW COLUMNS FROM {$found_table}", 0 );
+		if ( ! is_array( $cols ) ) $cols = [];
+
+		// Candidate columns we might use if present
+		$col_order_id   = in_array( 'order_id', $cols, true ) ? 'order_id' : ( in_array( '_meadow_screen_order_id', $cols, true ) ? '_meadow_screen_order_id' : null );
+		$col_session_id = in_array( 'session_id', $cols, true ) ? 'session_id' : ( in_array( '_meadow_session_id', $cols, true ) ? '_meadow_session_id' : null );
+		$col_last_seen  = in_array( 'last_seen', $cols, true ) ? 'last_seen' : ( in_array( '_meadow_last_seen', $cols, true ) ? '_meadow_last_seen' : null );
+		$col_mode       = in_array( 'screen_mode', $cols, true ) ? 'screen_mode' : ( in_array( '_meadow_screen_mode', $cols, true ) ? '_meadow_screen_mode' : null );
+
+		// If we can't even find any useful columns, bail out safely.
+		if ( ! $col_order_id && ! $col_session_id ) {
+			return [ 'order_ids' => [], 'session_ids' => [] ];
+		}
+
+		// Active window: last_seen newer than cutoff OR screen_mode indicates payment/vending in progress.
+		$where = [];
+		if ( $col_last_seen ) {
+			// last_seen may be unix int or datetime; try both safely
+			$cutoff_iso = gmdate( 'Y-m-d H:i:s', $active_cutoff_ts );
+			$where[] = $wpdb->prepare( "({$col_last_seen} >= %s OR {$col_last_seen} >= %d)", $cutoff_iso, $active_cutoff_ts );
+		}
+		if ( $col_mode ) {
+			$where[] = "({$col_mode} IN ('payment','paid','vending'))";
+		}
+
+		$where_sql = '';
+		if ( $where ) $where_sql = 'WHERE ' . implode( ' OR ', $where );
+
+		$fields = [];
+		if ( $col_order_id )   $fields[] = $col_order_id . ' AS order_id';
+		if ( $col_session_id ) $fields[] = $col_session_id . ' AS session_id';
+
+		$sql = "SELECT " . implode( ',', $fields ) . " FROM {$found_table} {$where_sql}";
+
+		try {
+			$rows = $wpdb->get_results( $sql, ARRAY_A );
+			if ( is_array( $rows ) ) {
+				foreach ( $rows as $r ) {
+					if ( isset( $r['order_id'] ) ) {
+						$oid = (int) $r['order_id'];
+						if ( $oid > 0 ) $order_ids[] = $oid;
+					}
+					if ( isset( $r['session_id'] ) && is_string( $r['session_id'] ) ) {
+						$sid = trim( $r['session_id'] );
+						if ( $sid !== '' ) $session_ids[] = $sid;
+					}
+				}
+			}
+		} catch ( \Throwable $e ) {
+			self::log( 'infer_active_kiosk_references error: ' . $e->getMessage() );
+		}
+
+		$order_ids = array_values( array_unique( $order_ids ) );
+		$session_ids = array_values( array_unique( $session_ids ) );
+
+		return [
+			'order_ids'   => $order_ids,
+			'session_ids' => $session_ids,
+		];
+	}
+
+	// ---- Counters for UI (best-effort, never fatal) ----
+	private static function get_counters( array $params ) : array {
+		$stage1 = 0; $stage2 = 0; $payment = 0;
+
+		if ( function_exists( 'wc_get_orders' ) ) {
+			try {
+				$stale_minutes = max( 5, (int) ( $params['stage1_stale_minutes'] ?? 60 ) );
+				$cutoff_ts = time() - ( $stale_minutes * 60 );
+				$cutoff_gmt = gmdate( 'Y-m-d H:i:s', $cutoff_ts );
+
+				$stage1 = (int) wc_get_orders( [
+					'status'       => [ 'on-hold', 'pending' ],
+					'limit'        => 1,
+					'paginate'     => true,
+					'date_created' => '<' . $cutoff_gmt,
+					'meta_query'   => [
+						[
+							'key'     => self::ORDER_TYPE_META_KEY,
+							'value'   => self::ORDER_TYPE_KIOSK,
+							'compare' => '=',
+						],
+						[
+							'key'     => self::CANCELLED_AT_META_KEY,
+							'compare' => 'NOT EXISTS',
+						],
+					],
+					'return'       => 'ids',
+				] )->total;
+			} catch ( \Throwable $e ) {
+				$stage1 = 0;
+			}
+
+			try {
+				$after_days = max( 1, (int) ( $params['stage2_trash_after_days'] ?? 14 ) );
+				$cutoff_ts = time() - ( $after_days * DAY_IN_SECONDS );
+				$cutoff_iso = gmdate( 'c', $cutoff_ts );
+
+				$stage2 = (int) wc_get_orders( [
+					'status'     => [ 'cancelled' ],
+					'limit'      => 1,
+					'paginate'   => true,
+					'meta_query' => [
+						[
+							'key'     => self::ORDER_TYPE_META_KEY,
+							'value'   => self::ORDER_TYPE_KIOSK,
+							'compare' => '=',
+						],
+						[
+							'key'     => self::CANCELLED_AT_META_KEY,
+							'value'   => $cutoff_iso,
+							'compare' => '<=',
+						],
+					],
+					'return'     => 'ids',
+				] )->total;
+			} catch ( \Throwable $e ) {
+				$stage2 = 0;
+			}
+		}
+
+		// Payment counter: a rough estimate (still conservative); does not attempt “active” exclusions here.
+		try {
+			$stuck_hours = max( 12, (int) ( $params['payment_stuck_hours'] ?? 48 ) );
+			$cutoff_ts = time() - ( $stuck_hours * HOUR_IN_SECONDS );
+			$q = new WP_Query( [
+				'post_type'      => self::PAYMENT_POST_TYPE,
+				'post_status'    => [ 'publish', 'pending', 'draft', 'private' ],
+				'posts_per_page' => 1,
+				'date_query'     => [
+					[
+						'before'    => gmdate( 'Y-m-d H:i:s', $cutoff_ts ),
+						'inclusive' => true,
+					]
+				],
+				'no_found_rows'  => false,
+				'fields'         => 'ids',
+			] );
+			$payment = (int) $q->found_posts;
+		} catch ( \Throwable $e ) {
+			$payment = 0;
+		}
+
+		return [
+			'stage1'  => $stage1,
+			'stage2'  => $stage2,
+			'payment' => $payment,
+		];
+	}
+
+	// ---- Logging (never fatal) ----
+	private static function log( string $msg ) : void {
+		if ( function_exists( 'error_log' ) ) {
+			error_log( '[Meadow Order Cleanup] ' . $msg );
+		}
+	}
 }
 
+Meadow_Kiosk_Order_Cleanup::init();
 
-    /**
-     * Cancel an order only if it's safe (unpaid + still on-hold).
-     */
-    private static function cancel_order_if_safe($order, bool $dry_run, int $user_id): bool {
-      if ( ! $order || ! is_a($order, 'WC_Order') ) return false;
-
-      // Still on-hold?
-      if ($order->get_status() !== 'on-hold') return false;
-
-      // Must be kiosk order
-      $otype = (string)$order->get_meta(self::ORDER_META_ORDER_TYPE, true);
-      if ($otype !== 'kiosk') return false;
-
-      // Never touch paid orders
-      if ($order->get_date_paid() || $order->get_transaction_id()) return false;
-
-      // Avoid repeating
-      if ($order->get_meta(self::ORDER_META_CLEANED_AT, true)) return false;
-
-      $kiosk_id = (string)$order->get_meta(self::ORDER_META_KIOSK_ID, true);
-      $motor    = (string)$order->get_meta(self::ORDER_META_MOTOR, true);
-      $ref      = (string)$order->get_meta(self::ORDER_META_REFERENCE, true);
-      $sid      = (string)$order->get_meta(self::ORDER_META_SESSION_ID, true);
-
-      $note = sprintf(
-        '[Meadow] Auto-cancelled stale on-hold kiosk order. kiosk=%s motor=%s ref=%s session=%s',
-        $kiosk_id !== '' ? $kiosk_id : '?',
-        $motor   !== '' ? $motor   : '?',
-        $ref     !== '' ? $ref     : '?',
-        $sid     !== '' ? $sid     : '?'
-      );
-
-      if ($dry_run) return true;
-
-      // Cancel + annotate
-      $order->update_status('cancelled', $note);
-
-      // Mark as cleaned so we don't repeat
-      $order->update_meta_data(self::ORDER_META_CLEANED_AT, time());
-      $order->update_meta_data(self::ORDER_META_CLEAN_NOTE, $note);
-      if ($user_id > 0) {
-        $order->add_order_note('[Meadow] Cleanup run by user_id=' . (int)$user_id);
-      }
-      $order->save();
-
-      return true;
-    }
-
-    /* -------------------- meadow_payment cleanup -------------------- */
-
-/**
- * Find stale meadow_payment posts that look genuinely stuck.
- */
-private static function find_stale_payment_posts(int $min_ts, int $max_ts, int $limit): array {
-  $stuck_statuses = [
-    'created',
-    'started',
-    'pending',
-    'payment_pending',
-    'awaiting_payment',
-    'awaiting_kiosk_payment',
-    'awaiting_vend',
-    'vend_pending',
-    'authorising',
-  ];
-
-  $q = new WP_Query([
-    'post_type'      => self::PAY_POST_TYPE,
-    'post_status'    => 'any',
-    'posts_per_page' => $limit,
-    'orderby'        => 'modified',
-    'order'          => 'ASC',
-    'meta_query'     => [
-      'relation' => 'AND',
-      [
-        'key'     => self::PAY_META_CLEANED_AT,
-        'compare' => 'NOT EXISTS',
-      ],
-      [
-        'key'     => self::PAY_META_STATUS,
-        'value'   => $stuck_statuses,
-        'compare' => 'IN',
-      ],
-    ],
-    'no_found_rows'  => true,
-  ]);
-
-  $out = [];
-  foreach ($q->posts as $p) {
-    $ts = self::payment_updated_ts((int)$p->ID);
-    if ($ts <= 0) continue;
-    if ($ts > $min_ts) continue; // too recent
-    if ($ts < $max_ts) continue; // too old
-    $out[] = $p;
-  }
-  return $out;
-}
-
-/**
- * Mark payment post abandoned (only if linked order isn't paid/completed).
- */
-private static function mark_payment_post_abandoned(int $pay_id, bool $dry_run): bool {
-  if ( get_post_meta($pay_id, self::PAY_META_CLEANED_AT, true) ) return false;
-
-  $status = (string) get_post_meta($pay_id, self::PAY_META_STATUS, true);
-
-  // Never touch already-final statuses
-  $final = ['paid','vended','completed','cancelled','abandoned','failed'];
-  if (in_array($status, $final, true)) return false;
-
-  // If it links to an order that is paid/processing/completed, don't touch it.
-  $order_id = (int) get_post_meta($pay_id, self::PAY_META_ORDER, true);
-  if ($order_id && function_exists('wc_get_order')) {
-    $order = wc_get_order($order_id);
-    if ($order) {
-      $st = $order->get_status();
-      if (in_array($st, ['processing','completed'], true)) return false;
-      if ($order->get_date_paid() || $order->get_transaction_id()) return false;
-    }
-  }
-
-  if ($dry_run) return true;
-
-  update_post_meta($pay_id, self::PAY_META_STATUS, 'abandoned');
-  update_post_meta($pay_id, self::PAY_META_CLEANED_AT, time());
-  update_post_meta($pay_id, self::PAY_META_CLEANED_NOTE, 'cleanup: stale payment post (prev_status=' . $status . ')');
-
-  return true;
-}
-
-    /* -------------------- Logging -------------------- */
-
-    private static function log(string $source, string $message): void {
-      $log = get_option(self::LOG_OPTION, []);
-      if ( ! is_array($log) ) $log = [];
-
-      $log[] = [
-        'time' => gmdate('c'),
-        'source' => $source,
-        'message' => $message,
-      ];
-
-      if (count($log) > self::LOG_MAX) {
-        $log = array_slice($log, -self::LOG_MAX);
-      }
-
-      update_option(self::LOG_OPTION, $log, false);
-    }
-  }
-
-  // Auto-init
-  add_action('plugins_loaded', ['Meadow_Order_Cleanup', 'init']);
-}
+endif;
