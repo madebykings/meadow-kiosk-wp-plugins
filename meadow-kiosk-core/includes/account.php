@@ -157,7 +157,28 @@ echo '</ul>';
               return;
             }
 
-            msg.textContent = 'Saved ✓ (' + (j.changed ? j.changed.length : 0) + ' rows)';
+            msg.textContent =
+  'Saved ✓ (' + (j.changed ? j.changed.length : 0) + ' rows) — reloading kiosk…';
+
+try {
+  await fetch('/wp-json/meadow/v1/kiosk-screen', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-WP-Nonce': nonce
+    },
+    body: JSON.stringify({
+      kiosk_id: <?php echo (int)$kiosk_id; ?>,
+      action: 'reload'
+    })
+  });
+} catch (e) {
+  // Non-fatal — stock is already saved
+}
+
+// Optional: refresh this page so UI matches kiosk
+setTimeout(() => location.reload(), 600);
+
           } catch (e) {
             msg.textContent = 'Failed: ' + e.message;
           }
