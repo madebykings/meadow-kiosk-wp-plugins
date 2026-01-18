@@ -45,12 +45,25 @@ class Meadow_Kiosk_Account {
       return;
     }
 
-    echo '<h3>Your kiosks</h3><ul>';
-    foreach ($kiosks as $k) {
-      $url = esc_url(add_query_arg(['kiosk_id' => $k->ID], wc_get_account_endpoint_url('kiosks')));
-      echo '<li><a href="'.$url.'">'.esc_html(get_the_title($k)).'</a></li>';
-    }
-    echo '</ul>';
+echo '<h3>Your kiosks</h3><ul>';
+
+foreach ($kiosks as $k) {
+  $url = esc_url(
+    add_query_arg(['kiosk_id' => $k->ID], wc_get_account_endpoint_url('kiosks'))
+  );
+
+  $title   = get_the_title($k);
+  $address = get_post_meta($k->ID, '_meadow_venue_address', true);
+
+  $label = $title;
+  if (!empty($address)) {
+    $label .= ' – ' . $address;
+  }
+
+  echo '<li><a href="'.$url.'">'.esc_html($label).'</a></li>';
+}
+
+echo '</ul>';
 
     $kiosk_id = intval($_GET['kiosk_id'] ?? 0);
     if (!$kiosk_id) return;
