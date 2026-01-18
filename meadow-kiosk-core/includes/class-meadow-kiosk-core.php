@@ -361,7 +361,11 @@ class Meadow_Kiosk_Core {
         register_rest_route('meadow/v1', '/venue/restock', [
   'methods'  => 'POST',
   'callback' => [$this, 'rest_venue_restock'],
-  'permission_callback' => function () { return is_user_logged_in(); },
+    'permission_callback' => function () {
+    if ( ! is_user_logged_in() ) return false;
+    $u = wp_get_current_user();
+    return user_can($u, 'manage_options') || in_array('venue', (array)$u->roles, true);
+  },
 ]);
 
 
@@ -1734,3 +1738,4 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return true;
     }
 }
+
