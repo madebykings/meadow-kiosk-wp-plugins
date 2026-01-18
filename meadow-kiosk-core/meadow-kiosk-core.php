@@ -20,6 +20,11 @@ require_once MEADOW_KIOSK_CORE_PATH . 'includes/account.php';
 
 function meadow_kiosk_core_boot() {
     $GLOBALS['meadow_kiosk_core'] = new Meadow_Kiosk_Core();
+
+    // ✅ THIS is what you were missing
+    if (class_exists('Meadow_Kiosk_Account')) {
+        $GLOBALS['meadow_kiosk_account'] = new Meadow_Kiosk_Account();
+    }
 }
 add_action('plugins_loaded', 'meadow_kiosk_core_boot');
 
@@ -28,5 +33,4 @@ register_deactivation_hook(__FILE__, function () {
     Meadow_Order_Cleanup::unschedule_cron();
   }
 });
-
 
