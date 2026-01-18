@@ -1,88 +1,129 @@
-/* global MEADOW_ADMIN_TOOLS, jQuery */
-jQuery(function($){
-  const CFG = window.MEADOW_ADMIN_TOOLS || {};
-  const $status = $('.meadow-kiosk-controls .meadow-ctrl-status');
+/* global jQuery, MEADOW_ADMIN_TOOLS */
+(function ($) {
+  "use strict";
 
-  function setStatus(msg, isErr){
-    if(!$status.length) return;
-    $status.text(msg).css('color', isErr ? '#b32d2e' : '#2e7d32');
+  function apiPost(url, nonce, payload) {
+    return $.ajax({
+      url: url,
+      method: "POST",
+      data: JSON.stringify(payload || {}),
+      contentType: "application/json; charset=utf-8",
+      dataType: "json",
+      headers: { "X-WP-Nonce": nonce },
+      timeout: 15000
+    });
   }
 
-  function postJSON(url, data){
-  return fetch(url, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-WP-Nonce': (CFG.nonce || '')
-    },
-    body: JSON.stringify(data || {})
-  }).then(r =>
-    r.json().catch(()=> ({})).then(j => ({ ok:r.ok, status:r.status, json:j }))
-  );
-}
+  function apiGet(url, nonce, params) {
+    const qs = params ? ("?" + new URLSearchParams(params).toString()) : "";
+    return $.ajax({
+      url: url + qs,
+      method: "GET",
+      dataType: "json",
+      headers: { "X-WP-Nonce": nonce },
+      timeout: 15000
+    });
+  }
 
-  // Reset screen buttons
-  $(document).on('click', '[data-meadow-reset]', function(e){
-    e.preventDefault();
-    const mode = String(this.getAttribute('data-meadow-reset') || 'ads');
+  function setStatus($box, html) {
+    $box.html(html);
+  }
 
-    setStatus('Resetting screen…');
-    postJSON(CFG.rest.screenReset, { kiosk_post_id: CFG.postId, mode })
-      .then(res => {
-        if(res.ok && res.json && res.json.ok){
-          setStatus('Screen reset → ' + mode);
-        } else {
-          const msg = (res.json && (res.json.message || res.json.code)) ? (res.json.message || res.json.code) : ('HTTP ' + res.status);
-          setStatus('Reset failed: ' + msg, true);
-        }
-      })
-      .catch(err => setStatus('Reset failed: ' + (err && err.message ? err.message : err), true));
-  });
+  function escapeHtml(s) {
+    return String(s || "").replace(/[&<>"']/g, (m) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    }[m]));
+  }
 
-  // Pi control actions
-  $(document).on('click', '[data-meadow-pi-action]', function(e){
-    e.preventDefault();
-    const action = String(this.getAttribute('data-meadow-pi-action') || '');
-    if(!action) return;
+  $(document).on("click", ".meadow-pi-action", function () {
+    const action = $(this).data("action");
+    const postId = parseInt($(this).data("kiosk-post-id") || 0, 10);
+    const nonce = MEADOW_ADMIN_TOOLS.nonce;
 
-    if(action === 'shutdown' && !confirm('Shutdown Pi now?')) return;
-    if(action === 'reboot' && !confirm('Reboot Pi now?')) return;
+    const $box = $(this).closest(".meadow-admin-tools").find(".meadow-pi-status");
 
-    setStatus('Sending Pi action: ' + action + '…');
-    postJSON(CFG.rest.piControl, {
-      kiosk_post_id: CFG.postId,
+    if (!postId) return;
+
+    setStatus($box, "Working…");
+
+    // Special actions that call dedicated routes
+    if (action === "ping") {
+      apiPost(MEADOW_ADMIN_TOOLS.rest.piPing, nonce, { kiosk_post_id: postId })
+        .done((r) => {
+          setStatus($box, r && r.ok ? "Ping OK ✅" : ("Ping failed ❌ " + escapeHtml(JSON.stringify(r))));
+        })
+        .fail((xhr) => {
+          setStatus($box, "Ping failed ❌ " + escapeHtml(xhr.responseText || xhr.statusText));
+        });
+      return;
+    }
+
+    // Default: /admin/pi/control
+    apiPost(MEADOW_ADMIN_TOOLS.rest.piControl, nonce, {
+      kiosk_post_id: postId,
       action: action,
       payload: {}
-    }).then(res => {
-      if(res.ok && res.json && res.json.ok){
-        const ok = !!res.json.action_ok;
-        setStatus((ok ? 'OK: ' : 'FAILED: ') + action + (res.json.action_err ? (' — ' + res.json.action_err) : ''), !ok);
-      } else {
-        const msg = (res.json && (res.json.message || res.json.code)) ? (res.json.message || res.json.code) : ('HTTP ' + res.status);
-        setStatus('Pi action failed: ' + msg, true);
-      }
-    }).catch(err => setStatus('Pi action failed: ' + (err && err.message ? err.message : err), true));
+    })
+      .done((r) => {
+        const ok = !!(r && r.ok);
+        setStatus($box, ok ? "Done ✅" : ("Failed ❌ " + escapeHtml(JSON.stringify(r))));
+      })
+      .fail((xhr) => {
+        setStatus($box, "Failed ❌ " + escapeHtml(xhr.responseText || xhr.statusText));
+      });
   });
 
-  // Motor test buttons
-  $(document).on('click', '[data-meadow-motor]', function(e){
-    e.preventDefault();
-    const motor = parseInt(this.getAttribute('data-meadow-motor') || '0', 10);
-    if(!motor) return;
-    if(!confirm('Spin motor ' + motor + ' now?')) return;
+  $(document).on("click", ".meadow-vend-test", function () {
+    const postId = parseInt($(this).data("kiosk-post-id") || 0, 10);
+    const motor = parseInt($(this).data("motor") || 0, 10);
+    const nonce = MEADOW_ADMIN_TOOLS.nonce;
+    const $box = $(this).closest(".meadow-admin-tools").find(".meadow-pi-status");
 
-    setStatus('Calling Pi vend-test for motor ' + motor + '…');
-    postJSON(CFG.rest.vendTest, {
-      kiosk_post_id: CFG.postId,
+    if (!postId || !motor) return;
+
+    setStatus($box, "Spinning motor " + motor + "…");
+
+    apiPost(MEADOW_ADMIN_TOOLS.rest.vendTest, nonce, {
+      kiosk_post_id: postId,
       motor: motor
-    }).then(res => {
-      if(res.ok && res.json && res.json.ok){
-        setStatus('Motor ' + motor + ' command sent.');
-      } else {
-        const msg = (res.json && (res.json.message || res.json.code)) ? (res.json.message || res.json.code) : ('HTTP ' + res.status);
-        setStatus('Vend-test failed: ' + msg, true);
-      }
-    }).catch(err => setStatus('Vend-test failed: ' + (err && err.message ? err.message : err), true));
+    })
+      .done((r) => {
+        const ok = !!(r && r.ok);
+        setStatus($box, ok ? ("Motor " + motor + " queued ✅") : ("Motor failed ❌ " + escapeHtml(JSON.stringify(r))));
+      })
+      .fail((xhr) => {
+        setStatus($box, "Motor failed ❌ " + escapeHtml(xhr.responseText || xhr.statusText));
+      });
   });
-});
+
+  // Optional: auto-fetch Pi status when opening the metabox (small + safe)
+  $(function () {
+    if (!MEADOW_ADMIN_TOOLS || !MEADOW_ADMIN_TOOLS.rest || !MEADOW_ADMIN_TOOLS.rest.piStatus) return;
+
+    const postId = parseInt(MEADOW_ADMIN_TOOLS.postId || 0, 10);
+    const nonce = MEADOW_ADMIN_TOOLS.nonce;
+    if (!postId) return;
+
+    const $box = $(".meadow-admin-tools .meadow-pi-status");
+    if (!$box.length) return;
+
+    apiGet(MEADOW_ADMIN_TOOLS.rest.piStatus, nonce, { kiosk_post_id: postId })
+      .done((r) => {
+        if (!r || !r.ok) return;
+        const pi = r.pi || {};
+        // show a tiny status line
+        const line =
+          "Pi status: " +
+          (pi.ok ? "OK" : "—") +
+          (pi.pi_git ? (" | git " + escapeHtml(pi.pi_git)) : "") +
+          (typeof pi.kiosk_running !== "undefined" ? (" | kiosk " + (pi.kiosk_running ? "RUNNING" : "STOPPED")) : "");
+        setStatus($box, line);
+      })
+      .fail(() => { /* ignore */ });
+  });
+
+})(jQuery);
