@@ -75,9 +75,11 @@ add_action('admin_enqueue_scripts', function ($hook) {
  * REST routes (WP-side). These are called by admin-tools.js.
  */
 add_action('rest_api_init', function () {
-    $perm = function (WP_REST_Request $req) {
-        return is_user_logged_in() && current_user_can('edit_posts');
-    };
+$perm = function (WP_REST_Request $req) {
+  if ( ! is_user_logged_in() ) return false;
+  $u = wp_get_current_user();
+  return user_can($u, 'manage_options') || in_array('venue', (array)$u->roles, true);
+};
 
     register_rest_route('meadow/v1', '/admin/pi/control', [
         'methods'             => 'POST',
@@ -154,9 +156,13 @@ function meadow_admin_tools_get_pi_target_or_error(int $post_id) {
     if (!$post_id || get_post_type($post_id) !== 'kiosk') {
         return new WP_Error('bad_request', 'Missing kiosk_post_id', ['status' => 400]);
     }
-    if ( ! current_user_can('edit_post', $post_id) ) {
-        return new WP_Error('forbidden', 'Not allowed', ['status' => 403]);
-    }
+// Admins can control any kiosk. Venues only their own.
+if ( ! current_user_can('manage_options') ) {
+  $venue_user_id = (string) get_post_meta($post_id, '_meadow_venue_user_id', true);
+  if ( $venue_user_id !== (string) get_current_user_id() ) {
+    return new WP_Error('forbidden', 'Not allowed', ['status' => 403]);
+  }
+}
 
     $kiosk_id = (int) get_post_meta($post_id, '_meadow_kiosk_id', true);
 
