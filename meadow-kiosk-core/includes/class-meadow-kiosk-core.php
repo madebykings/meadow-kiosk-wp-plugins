@@ -280,7 +280,7 @@ class Meadow_Kiosk_Core {
         $s = strtolower(trim((string)$raw));
         if ($s === '') return (bool)$default;
 
-        if (in_array($s, ['false','no','n','off','disabled','disable','unchecked'], true)) return false;
+        if (in_array($s, ['false','no','n','off','disabled','disable','unchecked','0'], true)) return false;
         return in_array($s, ['1','true','yes','y','on','enabled','enable','checked'], true);
     }
 
@@ -629,15 +629,18 @@ $payload['out_of_stock']   = ($payload['stock_total'] <= 0);
         $thankyou_timeout = (int) get_post_meta($kiosk->ID, '_meadow_thankyou_timeout', true);
 
         $slots = get_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, true);
-        if ( ! is_array($slots) ) $slots = [];
+$slots = $this->normalize_slots_array($slots);
 
-        $motors  = [];
-        $spin    = [];
-        $catalog = [];
+$motors  = [];
+$spin    = [];
+$catalog = [];
 
-        foreach ( $slots as $row ) {
-            $enabled = $this->slot_enabled($row[self::SLOT_FIELD_ENABLED] ?? null);
-            if ( ! $enabled ) continue;
+foreach ( $slots as $row ) {
+    if ( ! is_array($row) ) continue;
+
+    $enabled = $this->slot_enabled($row[self::SLOT_FIELD_ENABLED] ?? null);
+    if ( ! $enabled ) continue;
+
 
             $motor = (int) ($row[self::SLOT_FIELD_MOTOR] ?? 0);
             if ( ! $motor ) continue;
