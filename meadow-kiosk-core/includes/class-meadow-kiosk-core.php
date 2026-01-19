@@ -1132,10 +1132,13 @@ if ($chosen_idx !== null) {
     update_post_meta($kiosk->ID, '_meadow_config_version', time());
 
     // Alerts: use chosen slot index (not the stored one)
-    if ($prev_stock > 2 && $new_stock === 2) {
-        $this->send_stock_alert($kiosk_id,$chosen_idx,$product_id,$new_stock,'low',$order_id);
-    } elseif ($prev_stock > 0 && $new_stock === 0) {
-        $this->send_stock_alert($kiosk_id,$chosen_idx,$product_id,$new_stock,'out',$order_id);
+    // Alerts (optional — must never break vend flow)
+    if (method_exists($this, 'send_stock_alert')) {
+        if ($prev_stock > 2 && $new_stock === 2) {
+            $this->send_stock_alert($kiosk_id, $chosen_idx, $product_id, $new_stock, 'low', $order_id);
+        } elseif ($prev_stock > 0 && $new_stock === 0) {
+            $this->send_stock_alert($kiosk_id, $chosen_idx, $product_id, $new_stock, 'out', $order_id);
+        }   
     }
 
 } else {
@@ -1150,26 +1153,47 @@ if ($chosen_idx !== null) {
 
 
         // Complete order (and mirror meta onto WC object too)
-        if ( $order_id ) {
-            $wc_ok = $this->ensure_wc_loaded();
-            if ( ! is_wp_error($wc_ok) ) {
-                try {
-                    $order = wc_get_order($order_id);
-                    if ( $order ) {
-                        $order->update_meta_data('_meadow_order_type', 'kiosk');
-                        $order->update_meta_data('_meadow_kiosk_id', (int)$kiosk_id);
-                        $order->update_meta_data('_meadow_session_id', (string)$session_id);
-                        $order->update_meta_data('_meadow_reference', (string) get_post_meta($pay_post->ID, '_meadow_reference', true));
-                        $order->update_meta_data('_meadow_vend_status', 'vended');
-                        $order->save_meta_data();
+if ( $order_id ) {
+    $wc_ok = $this->ensure_wc_loaded();
 
-                        $order->update_status('completed', 'Meadow: vend confirmed.');
-                    }
-                } catch ( \Throwable $e ) {
-                    error_log('[Meadow] rest_vend_result: order update failed: ' . $e->getMessage());
-                }
+    // If Woo isn't fully available in this REST context, still complete the order (post_status)
+    if ( is_wp_error($wc_ok) || ! function_exists('wc_get_order') ) {
+        error_log('[Meadow] rest_vend_result: Woo not available, fallback completing order_id=' . (int)$order_id);
+
+        // Mirror key meta even without WC helpers
+        update_post_meta($order_id, '_meadow_order_type', 'kiosk');
+        update_post_meta($order_id, '_meadow_kiosk_id', (int)$kiosk_id);
+        update_post_meta($order_id, '_meadow_session_id', (string)$session_id);
+        update_post_meta($order_id, '_meadow_reference', (string) get_post_meta($pay_post->ID, '_meadow_reference', true));
+        update_post_meta($order_id, '_meadow_vend_status', 'vended');
+
+        // Woo order status is stored as the post_status
+        wp_update_post([ 'ID' => $order_id, 'post_status' => 'wc-completed' ]);
+
+    } else {
+        try {
+            $order = wc_get_order($order_id);
+            if ( $order ) {
+                $order->update_meta_data('_meadow_order_type', 'kiosk');
+                $order->update_meta_data('_meadow_kiosk_id', (int)$kiosk_id);
+                $order->update_meta_data('_meadow_session_id', (string)$session_id);
+                $order->update_meta_data('_meadow_reference', (string) get_post_meta($pay_post->ID, '_meadow_reference', true));
+                $order->update_meta_data('_meadow_vend_status', 'vended');
+                $order->save_meta_data();
+
+                $order->update_status('completed', 'Meadow: vend confirmed.');
+            } else {
+                // Very defensive: if wc_get_order returns null, still complete status
+                wp_update_post([ 'ID' => $order_id, 'post_status' => 'wc-completed' ]);
             }
+        } catch ( \Throwable $e ) {
+            error_log('[Meadow] rest_vend_result: order update failed: ' . $e->getMessage());
+            // Final fallback to avoid stuck on-hold
+            wp_update_post([ 'ID' => $order_id, 'post_status' => 'wc-completed' ]);
         }
+    }
+}
+
 
         // Screen -> thankyou
         $this->screen_set_payload($kiosk->ID, 'thankyou', $order_id);
