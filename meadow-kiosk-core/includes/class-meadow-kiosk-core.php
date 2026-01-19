@@ -281,7 +281,7 @@ class Meadow_Kiosk_Core {
         if ($s === '') return (bool)$default;
 
         if (in_array($s, ['false','no','n','off','disabled','disable','unchecked'], true)) return false;
-        return in_array($s, ['0','1','true','yes','y','on','enabled','enable','checked'], true);
+        return in_array($s, ['1','true','yes','y','on','enabled','enable','checked'], true);
     }
 
     private function ensure_wc_loaded() {
@@ -292,17 +292,19 @@ class Meadow_Kiosk_Core {
     }
 
     private function get_slot_by_motor( $kiosk_post_id, $motor ) {
-        $motor = (int) $motor;
-        $slots = get_post_meta($kiosk_post_id, self::SLOT_REPEATER_META_KEY, true);
-        if ( ! is_array($slots) ) $slots = [];
+    $motor = (int) $motor;
 
-        foreach ( $slots as $idx => $row ) {
-            if ( (int) ($row[self::SLOT_FIELD_MOTOR] ?? 0) === $motor ) {
-                return [ $idx, $row, $slots ];
-            }
+    $slots = get_post_meta($kiosk_post_id, self::SLOT_REPEATER_META_KEY, true);
+    $slots = $this->normalize_slots_array( $slots ); // ✅ critical
+
+    foreach ( $slots as $idx => $row ) {
+        if ( is_array($row) && (int) ($row[self::SLOT_FIELD_MOTOR] ?? 0) === $motor ) {
+            return [ (int)$idx, $row, $slots ];
         }
-        return [ null, null, $slots ];
     }
+    return [ null, null, $slots ];
+}
+
 
     /* ---------------------------------------------
      * CPT: payment sessions
@@ -486,7 +488,7 @@ public function rest_venue_restock( WP_REST_Request $req ) {
     
     private function get_stock_by_motor( $kiosk_post_id ): array {
     $slots = get_post_meta($kiosk_post_id, self::SLOT_REPEATER_META_KEY, true);
-    if ( ! is_array($slots) ) $slots = [];
+    $slots = $this->normalize_slots_array($slots);
 
     $out = [];
     foreach ( $slots as $row ) {
@@ -499,9 +501,9 @@ public function rest_venue_restock( WP_REST_Request $req ) {
         $stock = (int) ($row[self::SLOT_FIELD_STOCK] ?? 0);
         $out[(string)$motor] = $stock;
     }
-
     return $out;
 }
+
 
 
     public function rest_kiosk_screen( WP_REST_Request $req ) {
@@ -922,6 +924,8 @@ public function rest_payment_result( WP_REST_Request $req ) {
                     $order->update_meta_data('_meadow_motor', (int) get_post_meta($pay_post->ID, '_meadow_motor', true));
                     $order->update_meta_data('_meadow_session_id', (string)$session_id);
                     $order->update_meta_data('_meadow_reference', (string) get_post_meta($pay_post->ID, '_meadow_reference', true));
+                    $order->update_meta_data('_meadow_slot_index', get_post_meta($pay_post->ID, '_meadow_slot_index', true));
+                    $order->update_meta_data('_meadow_product_id', (int) get_post_meta($pay_post->ID, '_meadow_product_id', true));
                     $order->save_meta_data();
 
                     if ( $approved ) {
@@ -1015,65 +1019,132 @@ public function rest_vend_result( WP_REST_Request $req ) {
                 if ( $order ) $order->update_status('failed', 'Meadow: vend failed after approved payment.');
             }
 
-            update_post_meta($kiosk->ID, '_meadow_screen_mode', 'error');
-            if ( $order_id ) update_post_meta($kiosk->ID, '_meadow_screen_order_id', $order_id);
+            $this->screen_set_payload($kiosk->ID, 'error', $order_id);
 
             return [ 'ok' => true, 'vend' => 'failed' ];
         }
 
-        // Vend success -> decrement stock safely
-        $motor      = (int) get_post_meta($pay_post->ID, '_meadow_motor', true);
-        $product_id = (int) get_post_meta($pay_post->ID, '_meadow_product_id', true);
-        $slot_index = (int) get_post_meta($pay_post->ID, '_meadow_slot_index', true);
+        // Vend success -> decrement stock safely (MOTOR is source of truth)
+$motor      = (int) get_post_meta($pay_post->ID, '_meadow_motor', true);
+$product_id = (int) get_post_meta($pay_post->ID, '_meadow_product_id', true);
 
-        $slots = get_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, true);
+// IMPORTANT: slot_index must be nullable — do NOT cast missing value to 0
+$slot_index_raw = get_post_meta($pay_post->ID, '_meadow_slot_index', true);
+$slot_index = (is_numeric($slot_index_raw) && $slot_index_raw !== '') ? (int)$slot_index_raw : null;
 
-        // Normalize slots to prevent "ghost rows" caused by gappy numeric keys / non-array rows
-        $before_count = is_array($slots) ? count($slots) : 0;
-        $before_keys  = is_array($slots) ? implode(',', array_keys($slots)) : '';
-        $slots = $this->normalize_slots_array( $slots );
+$slots = get_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, true);
 
-        // Optional: log if normalization changed something (safe to remove later)
-        if ( $before_count && (count($slots) !== $before_count || ($before_keys !== '' && $before_keys !== implode(',', array_keys($slots))) ) ) {
-            error_log('[Meadow] rest_vend_result: normalized slots (count/keys changed) kiosk_id=' . $kiosk_id . ' before_count=' . $before_count . ' after_count=' . count($slots) . ' before_keys=' . $before_keys . ' after_keys=' . implode(',', array_keys($slots)));
+// Normalize slots to prevent "ghost rows"
+$before_count = is_array($slots) ? count($slots) : 0;
+$before_keys  = is_array($slots) ? implode(',', array_keys($slots)) : '';
+$slots = $this->normalize_slots_array( $slots );
+
+if ( $before_count && (count($slots) !== $before_count || ($before_keys !== '' && $before_keys !== implode(',', array_keys($slots))) ) ) {
+    error_log('[Meadow] rest_vend_result: normalized slots (count/keys changed) kiosk_id=' . $kiosk_id . ' before_count=' . $before_count . ' after_count=' . count($slots) . ' before_keys=' . $before_keys . ' after_keys=' . implode(',', array_keys($slots)));
+}
+
+$new_stock  = null;
+$prev_stock = null;
+
+// Helper: validate a candidate slot index matches expected motor/product (if provided)
+$slot_matches = function($idx) use ($slots, $motor, $product_id) {
+    if ($idx === null) return false;
+    if (!isset($slots[$idx]) || !is_array($slots[$idx])) return false;
+
+    $row_motor   = (int)($slots[$idx][self::SLOT_FIELD_MOTOR] ?? 0);
+    $row_product = (int)($slots[$idx][self::SLOT_FIELD_PRODUCT] ?? 0);
+
+    if ($motor > 0 && $row_motor !== $motor) return false;
+    if ($product_id > 0 && $row_product !== $product_id) return false;
+
+    return true;
+};
+
+// 1) Prefer motor lookup (source of truth)
+$chosen_idx = null;
+if ($motor > 0) {
+    foreach ($slots as $idx => $row) {
+        if (!is_array($row)) continue;
+        if ((int)($row[self::SLOT_FIELD_MOTOR] ?? 0) === $motor) {
+            $chosen_idx = (int)$idx;
+            break;
         }
+    }
+}
 
-        $new_stock  = null;
-        $prev_stock = null;
+// 2) If motor not found, try slot_index ONLY if it matches expectations
+if ($chosen_idx === null && $slot_matches($slot_index)) {
+    $chosen_idx = (int)$slot_index;
+}
 
-        // First try: use stored slot_index (fast path)
-        $slot_row_exists = (isset($slots[$slot_index]) && is_array($slots[$slot_index]));
-
-        // If slot_index is stale (JetEngine reorder), recover by motor lookup
-        if ( ! $slot_row_exists && $motor > 0 ) {
-            foreach ( $slots as $idx => $row ) {
-                if ( is_array($row) && (int)($row[self::SLOT_FIELD_MOTOR] ?? 0) === $motor ) {
-                    $slot_index = (int)$idx;
-                    $slot_row_exists = true;
-                    break;
-                }
-            }
+// 3) If still not found, try product lookup (only if exactly one match)
+if ($chosen_idx === null && $product_id > 0) {
+    $matches = [];
+    foreach ($slots as $idx => $row) {
+        if (!is_array($row)) continue;
+        if ((int)($row[self::SLOT_FIELD_PRODUCT] ?? 0) === $product_id) {
+            $matches[] = (int)$idx;
         }
+    }
+    if (count($matches) === 1) {
+        $chosen_idx = $matches[0];
+    } elseif (count($matches) > 1) {
+        update_post_meta($pay_post->ID, '_meadow_stock_decrement', 'skipped_ambiguous_product');
+        error_log('[Meadow] rest_vend_result: stock decrement skipped (ambiguous product) kiosk_id=' . $kiosk_id . ' order_id=' . (int)$order_id . ' motor=' . $motor . ' product_id=' . $product_id . ' matches=' . implode(',', $matches));
+    }
+}
 
-        if ( $slot_row_exists ) {
-            $prev_stock = (int) ($slots[$slot_index][self::SLOT_FIELD_STOCK] ?? 0);
-            $new_stock  = max(0, $prev_stock - 1);
-            $slots[$slot_index][self::SLOT_FIELD_STOCK] = $new_stock;
+// If chosen slot differs from stored slot_index, log it (this is your forensic trail)
+if ($chosen_idx !== null) {
+    if ($slot_index !== null && $slot_index !== $chosen_idx) {
+        $stored_row = (isset($slots[$slot_index]) && is_array($slots[$slot_index])) ? $slots[$slot_index] : null;
+        $stored_motor   = $stored_row ? (int)($stored_row[self::SLOT_FIELD_MOTOR] ?? 0) : 0;
+        $stored_product = $stored_row ? (int)($stored_row[self::SLOT_FIELD_PRODUCT] ?? 0) : 0;
 
-            // Normalize again right before save (belt & braces)
-            $slots = $this->normalize_slots_array( $slots );
+        error_log('[Meadow] rest_vend_result: slot_index mismatch; using chosen_idx. kiosk_id=' . $kiosk_id .
+            ' order_id=' . (int)$order_id .
+            ' motor=' . $motor .
+            ' product_id=' . $product_id .
+            ' stored_slot_index=' . (int)$slot_index .
+            ' stored_motor=' . $stored_motor .
+            ' stored_product=' . $stored_product .
+            ' chosen_idx=' . (int)$chosen_idx
+        );
+    } elseif ($slot_index === null) {
+        error_log('[Meadow] rest_vend_result: slot_index missing; using chosen_idx. kiosk_id=' . $kiosk_id .
+            ' order_id=' . (int)$order_id .
+            ' motor=' . $motor .
+            ' product_id=' . $product_id .
+            ' chosen_idx=' . (int)$chosen_idx
+        );
+    }
 
-            update_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, $slots);
-            update_post_meta($kiosk->ID, '_meadow_config_version', time()); // stock changed -> bump version
+    // Decrement
+    $prev_stock = (int) ($slots[$chosen_idx][self::SLOT_FIELD_STOCK] ?? 0);
+    $new_stock  = max(0, $prev_stock - 1);
+    $slots[$chosen_idx][self::SLOT_FIELD_STOCK] = $new_stock;
 
-            if ($prev_stock > 2 && $new_stock === 2) {
-                $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new_stock,'low',$order_id);
-            } elseif ($prev_stock > 0 && $new_stock === 0) {
-                $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new_stock,'out',$order_id);
-            }
-        } else {
-            update_post_meta($pay_post->ID, '_meadow_stock_decrement', 'skipped_no_slot');
-        }
+    $slots = $this->normalize_slots_array( $slots );
+    update_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, $slots);
+    update_post_meta($kiosk->ID, '_meadow_config_version', time());
+
+    // Alerts: use chosen slot index (not the stored one)
+    if ($prev_stock > 2 && $new_stock === 2) {
+        $this->send_stock_alert($kiosk_id,$chosen_idx,$product_id,$new_stock,'low',$order_id);
+    } elseif ($prev_stock > 0 && $new_stock === 0) {
+        $this->send_stock_alert($kiosk_id,$chosen_idx,$product_id,$new_stock,'out',$order_id);
+    }
+
+} else {
+    update_post_meta($pay_post->ID, '_meadow_stock_decrement', 'skipped_no_slot');
+    error_log('[Meadow] rest_vend_result: stock decrement skipped (no slot found) kiosk_id=' . $kiosk_id .
+        ' order_id=' . (int)$order_id .
+        ' motor=' . $motor .
+        ' product_id=' . $product_id .
+        ' stored_slot_index=' . (is_null($slot_index) ? 'null' : (string)$slot_index)
+    );
+}
+
 
         // Complete order (and mirror meta onto WC object too)
         if ( $order_id ) {
@@ -1098,8 +1169,7 @@ public function rest_vend_result( WP_REST_Request $req ) {
         }
 
         // Screen -> thankyou
-        update_post_meta($kiosk->ID, '_meadow_screen_mode', 'thankyou');
-        if ( $order_id ) update_post_meta($kiosk->ID, '_meadow_screen_order_id', $order_id);
+        $this->screen_set_payload($kiosk->ID, 'thankyou', $order_id);
 
         return [
             'ok'        => true,
