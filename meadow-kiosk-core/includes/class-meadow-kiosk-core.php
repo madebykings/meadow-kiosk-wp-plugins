@@ -559,7 +559,7 @@ $payload['out_of_stock']   = ($payload['stock_total'] <= 0);
         }
 
         $mode = strtolower( trim( $mode ) );
-        $allowed = [ 'ads','browse','payment','vending','thankyou','error','payment_failed' ];
+        $allowed = [ 'ads','browse','payment','finalising','vending','thankyou','error','payment_failed' ];
         if ( $mode === '' || ! in_array( $mode, $allowed, true ) ) {
             return new WP_Error('bad_request','Invalid mode',[ 'status'=>400, 'allowed'=>$allowed ]);
         }
