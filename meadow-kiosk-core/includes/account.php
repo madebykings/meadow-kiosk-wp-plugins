@@ -45,25 +45,26 @@ class Meadow_Kiosk_Account {
       return;
     }
 
-echo '<h3>Your kiosks</h3><ul>';
+    echo '<h3>Your kiosks</h3><div class="kiosko">';
+    echo '<p>Click your Kiosk below to update stock.</p>';
 
-foreach ($kiosks as $k) {
-  $url = esc_url(
-    add_query_arg(['kiosk_id' => $k->ID], wc_get_account_endpoint_url('kiosks'))
-  );
+    foreach ($kiosks as $k) {
+      $url = esc_url(
+        add_query_arg(['kiosk_id' => $k->ID], wc_get_account_endpoint_url('kiosks'))
+      );
 
-  $title   = get_the_title($k);
-  $address = get_post_meta($k->ID, '_meadow_venue_address', true);
+      $title   = get_the_title($k);
+      $address = get_post_meta($k->ID, '_meadow_venue_address', true);
 
-  $label = $title;
-  if (!empty($address)) {
-    $label .= ' – ' . $address;
-  }
+      $label = $title;
+      if (!empty($address)) {
+        $label .= ' – ' . $address;
+      }
 
-  echo '<li><a href="'.$url.'">'.esc_html($label).'</a></li>';
-}
+      echo '<p><a href="'.$url.'">'.esc_html($label).'</a></p>';
+    }
 
-echo '</ul>';
+    echo '</div>';
 
     $kiosk_id = intval($_GET['kiosk_id'] ?? 0);
     if (!$kiosk_id) return;
@@ -83,6 +84,25 @@ echo '</ul>';
     $slots = get_post_meta($kiosk_id, '_meadow_kiosk_slots', true);
     if (!is_array($slots)) $slots = [];
 
+    // --- Pre-pass: determine (top)/(bottom) and per-product allocated totals (for "Remaining") ---
+    $motors = [];
+    $allocated_by_product = []; // pid => total allocated stock across this kiosk
+    foreach ($slots as $row) {
+      $motor = intval($row['_meadow_motor_number'] ?? 0);
+      $pid   = intval($row['_meadow_wc_product_id'] ?? 0);
+      $stock = intval($row['_meadow_current_stock'] ?? 0);
+
+      if ($motor > 0) $motors[] = $motor;
+
+      if ($pid > 0) {
+        if (!isset($allocated_by_product[$pid])) $allocated_by_product[$pid] = 0;
+        $allocated_by_product[$pid] += max(0, $stock);
+      }
+    }
+
+    $min_motor = $motors ? min($motors) : null;
+    $max_motor = $motors ? max($motors) : null;
+
     $nonce = wp_create_nonce('wp_rest');
     ?>
     <h3>Stock – <?php echo esc_html(get_the_title($kiosk_id)); ?></h3>
@@ -94,6 +114,7 @@ echo '</ul>';
           <th>Product</th>
           <th>Capacity</th>
           <th>Stock</th>
+          <th>Remaining</th>
         </tr>
       </thead>
       <tbody>
@@ -105,9 +126,28 @@ echo '</ul>';
 
           $product = $pid ? wc_get_product($pid) : null;
           $name = $product ? $product->get_name() : '—';
+
+          // Motor label (top/bottom)
+          $motor_label = (string)$motor;
+          if ($motor > 0 && $min_motor !== null && $max_motor !== null) {
+            if ($motor === $min_motor) $motor_label .= ' (top)';
+            if ($motor === $max_motor && $max_motor !== $min_motor) $motor_label .= ' (bottom)';
+          }
+
+// Remaining = WooCommerce product stock (as-is; no kiosk allocation maths)
+$remaining_display = '—';
+if ($product) {
+  if ($product->managing_stock()) {
+    $wc_stock = $product->get_stock_quantity();
+    $remaining_display = ($wc_stock === null) ? '—' : (string) intval($wc_stock);
+  } else {
+    $remaining_display = '—';
+  }
+}
+
         ?>
           <tr>
-            <td><?php echo esc_html($motor); ?></td>
+            <td><?php echo esc_html($motor_label); ?></td>
             <td><?php echo esc_html($name); ?></td>
             <td><?php echo esc_html($cap); ?></td>
             <td>
@@ -120,6 +160,7 @@ echo '</ul>';
                 style="width:90px"
               />
             </td>
+            <td><?php echo esc_html($remaining_display); ?></td>
           </tr>
         <?php endforeach; ?>
       </tbody>
@@ -157,48 +198,45 @@ echo '</ul>';
               return;
             }
 
-msg.textContent =
-  'Saved ✓ (' + (j.changed ? j.changed.length : 0) + ' rows) — reloading kiosk…';
+            msg.textContent =
+              'Saved ✓ (' + (j.changed ? j.changed.length : 0) + ' rows) — reloading kiosk…';
 
-try {
-  // 🔥 This is the SAME mechanism as the admin metabox “Reload kiosk” button
-  const rPi = await fetch('/wp-json/meadow/v1/admin/pi/control', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-WP-Nonce': nonce
-    },
-    body: JSON.stringify({
-      kiosk_post_id: <?php echo (int)$kiosk_id; ?>,
-      action: 'reload_kiosk',
-      payload: {}
-    })
-  });
+            try {
+              // same mechanism as admin metabox “Reload kiosk”
+              const rPi = await fetch('/wp-json/meadow/v1/admin/pi/control', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-WP-Nonce': nonce
+                },
+                body: JSON.stringify({
+                  kiosk_post_id: <?php echo (int)$kiosk_id; ?>,
+                  action: 'reload_kiosk',
+                  payload: {}
+                })
+              });
 
-  const jPi = await rPi.json().catch(() => ({}));
-  console.log('pi/control reload_kiosk:', rPi.status, jPi);
+              const jPi = await rPi.json().catch(() => ({}));
+              console.log('pi/control reload_kiosk:', rPi.status, jPi);
 
-  // Optional: also reset WP screen mode (nice for UI consistency)
-  await fetch('/wp-json/meadow/v1/admin/screen-reset', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-WP-Nonce': nonce
-    },
-    body: JSON.stringify({
-      kiosk_post_id: <?php echo (int)$kiosk_id; ?>,
-      mode: 'ads'
-    })
-  });
+              // optional: reset WP screen mode
+              await fetch('/wp-json/meadow/v1/admin/screen-reset', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-WP-Nonce': nonce
+                },
+                body: JSON.stringify({
+                  kiosk_post_id: <?php echo (int)$kiosk_id; ?>,
+                  mode: 'ads'
+                })
+              });
 
-} catch (e) {
-  console.log('reload failed:', e);
-}
+            } catch (e) {
+              console.log('reload failed:', e);
+            }
 
-// Refresh the venue page
-setTimeout(() => location.reload(), 800);
-
-
+            setTimeout(() => location.reload(), 800);
 
           } catch (e) {
             msg.textContent = 'Failed: ' + e.message;
