@@ -3,7 +3,7 @@ if ( ! defined('ABSPATH') ) exit;
 
 class Meadow_Kiosk_Core {
 
-    const DB_VERSION = '2026-01-16-no-queues-one-shot';
+    const DB_VERSION = '2026-01-20-kiosk-monitor-columns';
     const PAY_POST_TYPE = 'meadow_payment';
 
     // JetEngine repeater meta
@@ -105,7 +105,23 @@ class Meadow_Kiosk_Core {
         ) {$charset_collate};";
 
         dbDelta($sql);
+
+        // Ensure monitoring columns exist (safe + compatible)
+        $cols = $wpdb->get_col("SHOW COLUMNS FROM `{$table}`");
+        $cols = array_map('strtolower', is_array($cols) ? $cols : []);
+
+        if (!in_array('mode_since_utc', $cols, true)) {
+            $wpdb->query("ALTER TABLE `{$table}` ADD COLUMN `mode_since_utc` DATETIME NULL");
+        }
+        if (!in_array('last_alert_key', $cols, true)) {
+            $wpdb->query("ALTER TABLE `{$table}` ADD COLUMN `last_alert_key` VARCHAR(80) NULL");
+        }
+        if (!in_array('last_alert_utc', $cols, true)) {
+            $wpdb->query("ALTER TABLE `{$table}` ADD COLUMN `last_alert_utc` DATETIME NULL");
+        }
+
         update_option('meadow_db_version', self::DB_VERSION);
+
     }
 
     private function dual_write_enabled() {
@@ -131,6 +147,16 @@ class Meadow_Kiosk_Core {
 
         $row = $this->get_kiosk_row($kiosk_post_id);
         $now = $this->utc_now_mysql();
+
+        // Track when the (screen) mode last changed for stuck-mode alerts.
+        if (isset($data['screen_mode'])) {
+            $new_mode  = strtolower(trim((string)$data['screen_mode']));
+            $prev_mode = ($row && isset($row['screen_mode'])) ? strtolower(trim((string)$row['screen_mode'])) : '';
+
+            if (!$row || ($new_mode !== '' && $new_mode !== $prev_mode)) {
+                $data['mode_since_utc'] = $now;
+            }
+        }
 
         if (!$row) {
             $data = array_merge([
@@ -1981,8 +2007,3 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return true;
     }
 }
-
-
-
-
-
