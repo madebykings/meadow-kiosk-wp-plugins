@@ -156,11 +156,21 @@ class Meadow_Kiosk_Monitor_V2 {
   }
 
   static function kiosk_label_from_row(array $r) {
-    // Prefer kiosk_id if present (your live table has it), else kiosk_post_id.
-    $kid = isset($r['kiosk_id']) ? (int)$r['kiosk_id'] : 0;
-    if ($kid > 0) return 'Kiosk #' . $kid;
-    return 'Kiosk Post #' . (int)($r['kiosk_post_id'] ?? 0);
+  $post_id = (int)($r['kiosk_post_id'] ?? 0);
+  if ($post_id > 0) {
+    $title = get_the_title($post_id);
+    if (is_string($title) && trim($title) !== '') {
+      return trim($title); // e.g. "Kiosk 1"
+    }
   }
+
+  // Fallback to kiosk_id if present
+  $kid = isset($r['kiosk_id']) ? (int)$r['kiosk_id'] : 0;
+  if ($kid > 0) return 'Kiosk #' . $kid;
+
+  return 'Kiosk Post #' . $post_id;
+}
+
 
   static function cron_run() {
     global $wpdb;
