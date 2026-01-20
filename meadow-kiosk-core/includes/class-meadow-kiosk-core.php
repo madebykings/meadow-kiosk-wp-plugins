@@ -1435,9 +1435,9 @@ if ( $order_id ) {
     update_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, $slots);
 
     if ($current > 2 && $new === 2) {
-        $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new,'low',$order_id);
+        $this->send_stock_alert($kiosk_id, $motor, $product_id, $new, 'low', $order_id);
     } elseif ($current > 0 && $new === 0) {
-        $this->send_stock_alert($kiosk_id,$slot_index,$product_id,$new,'out',$order_id);
+        $this->send_stock_alert($kiosk_id, $motor, $product_id, $new, 'out', $order_id);
     }
 }
 
@@ -1930,4 +1930,5 @@ if ( $order_id ) {
         return true;
     }
 }
+
 
