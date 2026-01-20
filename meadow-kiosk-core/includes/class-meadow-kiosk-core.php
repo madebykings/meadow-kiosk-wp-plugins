@@ -324,6 +324,14 @@ class Meadow_Kiosk_Core {
         $lines[] = 'Row/Motor: ' . $motor_number;
         $lines[] = 'Stock: ' . (int) $new_stock;
 
+        // If we got a product_id but no product_name, resolve it
+        if ( empty($extra['product_name']) && !empty($extra['product_id']) && function_exists('wc_get_product') ) {
+            $p = wc_get_product( (int) $extra['product_id'] );
+            if ( $p ) {
+                $extra['product_name'] = $p->get_name();
+            }
+        }
+
         // Optional extra context if you have it (product, order, etc.)
         if ( ! empty( $extra['product_name'] ) ) {
             $lines[] = 'Product: ' . (string) $extra['product_name'];
@@ -1974,6 +1982,7 @@ if ( $order_id ) {
         return true;
     }
 }
+
 
 
 
