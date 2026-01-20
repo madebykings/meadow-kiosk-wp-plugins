@@ -47,58 +47,6 @@ class Meadow_Kiosk_Pi_Bridge {
         return '';
     }
 
-    private function send_stock_alert( $kiosk_id, $motor_number, $new_stock, $type = 'out', $extra = [] ) {
-        $kiosk_id = (int) $kiosk_id;
-        $motor_number = (int) $motor_number;
-
-        if ( $kiosk_id <= 0 || $motor_number <= 0 ) return;
-
-        // Pull alert recipient from kiosk CPT meta
-        $to = trim( (string) get_post_meta( $kiosk_id, '_meadow_stock_alert_email', true ) );
-        if ( empty( $to ) || ! is_email( $to ) ) return;
-
-        $type = strtolower( (string) $type );
-        if ( $type !== 'low' && $type !== 'out' ) $type = 'out';
-
-        // Prevent spam: one alert per kiosk+motor+type per 12h
-        $lock_key = 'meadow_stock_alert_' . $type . '_' . $kiosk_id . '_' . $motor_number;
-        if ( get_transient( $lock_key ) ) return;
-        set_transient( $lock_key, 1, 12 * HOUR_IN_SECONDS );
-
-        $kiosk_title = get_the_title( $kiosk_id );
-        if ( ! $kiosk_title ) $kiosk_title = 'Kiosk #' . $kiosk_id;
-
-        $subject = sprintf(
-            '[Meadow] %s: Row %d %s',
-            $kiosk_title,
-            $motor_number,
-            ($type === 'low' ? 'low stock' : 'out of stock')
-        );
-
-        $lines = [];
-        $lines[] = 'Kiosk: ' . $kiosk_title . ' (ID ' . $kiosk_id . ')';
-        $lines[] = 'Row/Motor: ' . $motor_number;
-        $lines[] = 'Stock: ' . (int) $new_stock;
-
-        // Optional extra context if you have it (product, order, etc.)
-        if ( ! empty( $extra['product_name'] ) ) {
-            $lines[] = 'Product: ' . (string) $extra['product_name'];
-        }
-        if ( ! empty( $extra['order_id'] ) ) {
-            $lines[] = 'Order: #' . (int) $extra['order_id'];
-        }
-        if ( ! empty( $extra['site'] ) ) {
-            $lines[] = 'Site: ' . (string) $extra['site'];
-        }
-
-        $message = implode( "\n", $lines ) . "\n";
-
-        $headers = [ 'Content-Type: text/plain; charset=UTF-8' ];
-
-        // wp_mail returns bool; we intentionally don't fatal if it fails
-        wp_mail( $to, $subject, $message, $headers );
-    }
-
     private function proxy_to_pi(int $kiosk_post_id, string $path, array $payload, int $timeout = 15) {
         $base = $this->get_pi_base_for_kiosk_post($kiosk_post_id);
         if ( $base === '' ) {
@@ -250,4 +198,5 @@ class Meadow_Kiosk_Pi_Bridge {
         return $this->proxy_to_pi((int)$kiosk->ID, '/admin/vend-test', $pi_payload, 25);
     }
 }
+
 
