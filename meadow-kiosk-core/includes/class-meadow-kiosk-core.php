@@ -1186,14 +1186,35 @@ if ($chosen_idx !== null) {
     // Alerts: use chosen slot index (not the stored one)
     // Alerts (optional — must never break vend flow)
     if (method_exists($this, 'send_stock_alert')) {
+    try {
         if ($prev_stock > 2 && $new_stock === 2) {
-            $this->send_stock_alert($kiosk_id, $chosen_idx, $product_id, $new_stock, 'low', $order_id);
+            $this->send_stock_alert(
+                $kiosk_id,
+                $motor,          // ✅ motor number (not chosen_idx)
+                $new_stock,      // ✅ stock number
+                'low',
+                [
+                    'order_id'   => (int) $order_id,
+                    'product_id' => (int) $product_id,
+                ]
+            );
         } elseif ($prev_stock > 0 && $new_stock === 0) {
-            $this->send_stock_alert($kiosk_id, $chosen_idx, $product_id, $new_stock, 'out', $order_id);
-        }   
+            $this->send_stock_alert(
+                $kiosk_id,
+                $motor,          // ✅ motor number
+                $new_stock,      // ✅ stock number
+                'out',
+                [
+                    'order_id'   => (int) $order_id,
+                    'product_id' => (int) $product_id,
+                ]
+            );
+        }
+    } catch (\Throwable $e) {
+        // never break vend flow
     }
-
-} else {
+}
+ else {
     update_post_meta($pay_post->ID, '_meadow_stock_decrement', 'skipped_no_slot');
     error_log('[Meadow] rest_vend_result: stock decrement skipped (no slot found) kiosk_id=' . $kiosk_id .
         ' order_id=' . (int)$order_id .
@@ -1434,11 +1455,34 @@ if ( $order_id ) {
 
     update_post_meta($kiosk->ID, self::SLOT_REPEATER_META_KEY, $slots);
 
+    try {
     if ($current > 2 && $new === 2) {
-        $this->send_stock_alert($kiosk_id, $motor, $product_id, $new, 'low', $order_id);
+        $this->send_stock_alert(
+            $kiosk_id,
+            $motor,
+            $new,
+            'low',
+            [
+                'order_id'   => (int) $order_id,
+                'product_id' => (int) $product_id,
+            ]
+        );
     } elseif ($current > 0 && $new === 0) {
-        $this->send_stock_alert($kiosk_id, $motor, $product_id, $new, 'out', $order_id);
+        $this->send_stock_alert(
+            $kiosk_id,
+            $motor,
+            $new,
+            'out',
+            [
+                'order_id'   => (int) $order_id,
+                'product_id' => (int) $product_id,
+            ]
+        );
     }
+} catch (\Throwable $e) {
+    // never break order completion flow
+}
+
 }
 
 
@@ -1930,5 +1974,6 @@ if ( $order_id ) {
         return true;
     }
 }
+
 
 
