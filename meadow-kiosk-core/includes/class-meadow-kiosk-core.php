@@ -1844,9 +1844,30 @@ public function rest_kiosk_ads( WP_REST_Request $req ) {
  * Robust assignment check (JetEngine relations can be directional)
  */
 private function ad_assigned_to_kiosk( int $ad_id, int $kiosk_post_id ): bool {
-    return $this->jet_relation_has_link(self::RELATION_AD_TO_KIOSK_ID, $ad_id, $kiosk_post_id)
-        || $this->jet_relation_has_link(self::RELATION_AD_TO_KIOSK_ID, $kiosk_post_id, $ad_id);
+    global $wpdb;
+
+    // JetEngine creates a dedicated table per relation when "Register separate DB table" is ON
+    $table = $wpdb->prefix . 'jet_rel_' . self::RELATION_AD_TO_KIOSK_ID;
+
+    // Parent = Ad, Child = Kiosk
+    $exists = $wpdb->get_var(
+        $wpdb->prepare(
+            "
+            SELECT 1
+            FROM {$table}
+            WHERE parent_object_id = %d
+              AND child_object_id  = %d
+            LIMIT 1
+            ",
+            $ad_id,
+            $kiosk_post_id
+        )
+    );
+
+    return (bool) $exists;
 }
+
+
 
 /**
  * Kiosk denylist: block ads whose ad_segment terms intersect kiosk's blocked segments.
