@@ -1840,6 +1840,48 @@ public function rest_kiosk_ads( WP_REST_Request $req ) {
         return false;
     }
 
+    /**
+ * Robust assignment check (JetEngine relations can be directional)
+ */
+private function ad_assigned_to_kiosk( int $ad_id, int $kiosk_post_id ): bool {
+    return $this->jet_relation_has_link(self::RELATION_AD_TO_KIOSK_ID, $ad_id, $kiosk_post_id)
+        || $this->jet_relation_has_link(self::RELATION_AD_TO_KIOSK_ID, $kiosk_post_id, $ad_id);
+}
+
+/**
+ * Kiosk denylist: block ads whose ad_segment terms intersect kiosk's blocked segments.
+ * Kiosk meta `_meadow_blocked_ad_segments` stores TERM IDs (checkbox field).
+ */
+private function kiosk_allows_ad_by_segment_blocklist( int $kiosk_post_id, int $ad_id ): bool {
+
+    // Ad content segments (taxonomy)
+    $ad_seg_ids = wp_get_post_terms($ad_id, 'ad_segment', [ 'fields' => 'ids' ]);
+    if ( ! is_array($ad_seg_ids) ) $ad_seg_ids = [];
+    $ad_seg_ids = array_map('intval', $ad_seg_ids);
+
+    // If ad has no segments, nothing to block
+    if ( empty($ad_seg_ids) ) return true;
+
+    // Kiosk blocked segments (TERM IDs from checkbox field)
+    $blocked = get_post_meta($kiosk_post_id, '_meadow_blocked_ad_segments', true);
+
+    if ( ! is_array($blocked) ) {
+        if ( is_string($blocked) && $blocked !== '' ) {
+            $blocked = array_filter(array_map('trim', explode(',', $blocked)));
+        } else {
+            $blocked = [];
+        }
+    }
+
+    $blocked_ids = array_map('intval', $blocked);
+
+    if ( empty($blocked_ids) ) return true;
+
+    // Any intersection = blocked
+    return ! (bool) array_intersect($ad_seg_ids, $blocked_ids);
+}
+
+
     private function get_ads_linked_to_subscription( int $subscription_id ): array {
         if ( ! $subscription_id ) return [];
         $q = new WP_Query([
