@@ -1806,27 +1806,62 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return $t ? (int)$t : 0;
     }
 
-    private function format_ad_for_playlist( WP_Post $ad_post ) {
-        $type = (string) get_post_meta($ad_post->ID, '_meadow_creative_type', true);
-        $dur  = (int) get_post_meta($ad_post->ID, '_meadow_ad_roation_time', true);
-        if ( ! $dur ) $dur = 10;
+        private function format_ad_for_playlist( WP_Post $ad_post ) {
+    $type = (string) get_post_meta($ad_post->ID, '_meadow_creative_type', true);
 
-        $att = 0;
-        if ( $type === 'image' ) $att = (int) get_post_meta($ad_post->ID, '_meadow_image_file', true);
-        elseif ( $type === 'video' ) $att = (int) get_post_meta($ad_post->ID, '_meadow_video_file', true);
-        else return null;
-
-        if ( ! $att ) return null;
-        $url = wp_get_attachment_url($att);
-        if ( ! $url ) return null;
-
-        return [
-            'ad_id'    => (int) $ad_post->ID,
-            'type'     => $type,
-            'url'      => $url,
-            'duration' => $dur,
-        ];
+    // Duration (keep existing typo key, but add a correct fallback too)
+    $dur  = (int) get_post_meta($ad_post->ID, '_meadow_ad_roation_time', true);
+    if ( ! $dur ) {
+        $dur = (int) get_post_meta($ad_post->ID, '_meadow_ad_rotation_time', true);
     }
+    if ( ! $dur ) $dur = 10;
+
+    // Pull the raw field (JetEngine/ACF may store ID, URL, or array)
+    if ( $type === 'image' ) {
+        $raw = get_post_meta($ad_post->ID, '_meadow_image_file', true);
+    } elseif ( $type === 'video' ) {
+        $raw = get_post_meta($ad_post->ID, '_meadow_video_file', true);
+    } else {
+        return null;
+    }
+
+    if ( empty($raw) ) return null;
+
+    // Normalise to URL:
+    $url = '';
+
+    // If JetEngine stored an array
+    if ( is_array($raw) ) {
+        if ( !empty($raw['url']) ) {
+            $url = (string) $raw['url'];
+        } elseif ( !empty($raw['id']) ) {
+            $url = (string) wp_get_attachment_url( (int) $raw['id'] );
+        } else {
+            // Sometimes it’s like [0 => <something>]
+            $first = reset($raw);
+            if ( is_numeric($first) ) $url = (string) wp_get_attachment_url( (int) $first );
+            elseif ( is_string($first) ) $url = $first;
+        }
+    }
+    // If stored as an attachment ID (string/int)
+    elseif ( is_numeric($raw) ) {
+        $url = (string) wp_get_attachment_url( (int) $raw );
+    }
+    // If stored as a direct URL
+    elseif ( is_string($raw) ) {
+        $url = $raw;
+    }
+
+    $url = trim($url);
+    if ( $url === '' ) return null;
+
+    return [
+        'ad_id'    => (int) $ad_post->ID,
+        'type'     => $type,
+        'url'      => esc_url_raw($url),
+        'duration' => (int) $dur,
+    ];
+}
 
     private function ad_matches_kiosk_segments( int $ad_post_id, array $kiosk_segments ): bool {
         if ( empty($kiosk_segments) ) return false;
@@ -2007,3 +2042,4 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return true;
     }
 }
+
