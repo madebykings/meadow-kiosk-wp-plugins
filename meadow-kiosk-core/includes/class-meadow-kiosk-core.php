@@ -1378,59 +1378,199 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return [ 'ok' => true ];
     }
 
-    public function rest_kiosk_ads( WP_REST_Request $req ) {
-        $this->nocache();
 
-        $kiosk_id = (int) $req->get_param('kiosk_id');
-        if (!$kiosk_id) return new WP_Error('bad_request','Missing kiosk_id',[ 'status'=>400 ]);
+public function rest_kiosk_ads( WP_REST_Request $req ) {
+    $this->nocache();
 
-        $kiosk = meadow_kiosk_get_kiosk_by_kiosk_id($kiosk_id);
-        if (!$kiosk) return new WP_Error('not_found','Kiosk not found',[ 'status'=>404 ]);
+    // --------------------------------------------------
+    // DEBUG (token-gated; works even if REST cookies aren't auth'd)
+    // --------------------------------------------------
+    $debug     = (int) $req->get_param('debug');
+    $debug_key = (string) $req->get_param('debug_key');
 
-        $now = time();
-        $kiosk_segments = wp_get_post_terms($kiosk->ID, self::TAX_KIOSK_SEGMENT, [ 'fields' => 'slugs' ]);
-        if (!is_array($kiosk_segments)) $kiosk_segments = [];
+    $resp_debug = null;
 
-        $house = $this->query_ads_for_playlist([
-            'billing_model' => 'free',
-            'now' => $now,
-        ]);
+    if ( $debug === 1 && hash_equals('abcd1234', $debug_key) ) {
 
-        $paid = $this->query_ads_for_playlist([
-            'billing_model' => 'flat',
-            'now' => $now,
-        ]);
-
-        $out = [];
-
-        foreach ($house as $p) {
-            $item = $this->format_ad_for_playlist($p);
-            if ($item) $out[] = $item;
-        }
-
-        foreach ($paid as $p) {
-            $adv_user_id = (int) get_post_meta($p->ID, '_meadow_advertiser_user_id', true);
-            if (!$adv_user_id) continue;
-
-            $sub_id = (int) get_post_meta($p->ID, '_meadow_subscription_id', true);
-            if (!$this->subscription_is_active_for_user($adv_user_id, $sub_id)) continue;
-
-            $assigned = $this->jet_relation_has_link(self::RELATION_AD_TO_KIOSK_ID, $p->ID, $kiosk->ID);
-            $seg_ok   = $this->ad_matches_kiosk_segments($p->ID, $kiosk_segments);
-            if (!$assigned && !$seg_ok) continue;
-
-            $item = $this->format_ad_for_playlist($p);
-            if ($item) $out[] = $item;
-        }
-
-        if (count($out) > 1) shuffle($out);
-
-        return [
-            'kiosk_id' => $kiosk_id,
-            'default_duration' => 10,
-            'ads' => $out,
+        $resp_debug = [
+            'now_utc' => gmdate('c'),
+            'route'   => $req->get_route(),
+            'is_admin' => current_user_can('manage_options') ? 1 : 0,
+            'wcs_users_subs_available' => function_exists('wcs_get_users_subscriptions'),
+            'wcs_get_subscription_available' => function_exists('wcs_get_subscription'),
+            'ads_checked' => [],
+            'gate' => [],          // per-ad gate result
+            'gate_detail' => [],   // per-ad detail
         ];
+
+        // Inspect all ACTIVE ads directly (ground truth)
+        $q = new WP_Query([
+            'post_type'      => self::AD_POST_TYPE, // 'ad'
+            'post_status'    => 'publish',
+            'posts_per_page' => 100,
+            'meta_query'     => [
+                [ 'key' => '_meadow_status', 'value' => 'active', 'compare' => '=' ],
+            ],
+            'no_found_rows'  => true,
+            'fields'         => 'ids',
+        ]);
+
+        foreach ( $q->posts as $ad_id ) {
+            $billing = (string) get_post_meta($ad_id, '_meadow_billing_model', true);
+            $adv_uid = (int) get_post_meta($ad_id, '_meadow_advertiser_user_id', true);
+            $sub_id  = (int) get_post_meta($ad_id, '_meadow_subscription_id', true);
+
+            $sub_exists = false;
+            $sub_uid = 0;
+            $sub_status = '';
+            $sub_ok = false;
+
+            if ( $billing === 'flat' && function_exists('wcs_get_subscription') && $sub_id ) {
+                $sub = wcs_get_subscription($sub_id);
+                if ( $sub ) {
+                    $sub_exists = true;
+                    $sub_uid = (int) $sub->get_user_id();
+                    $sub_status = (string) $sub->get_status();
+                    $sub_ok = ( $sub_uid === $adv_uid ) && $sub->has_status('active');
+                }
+            }
+
+            $resp_debug['ads_checked'][] = [
+                'ad_id' => (int) $ad_id,
+                'billing' => $billing,
+                'adv_user_id' => $adv_uid,
+                'sub_id' => $sub_id,
+                'sub_exists' => $sub_exists,
+                'sub_user_id' => $sub_uid,
+                'sub_status' => $sub_status,
+                'sub_ok_strict' => $sub_ok,
+            ];
+        }
     }
+
+    // --------------------------------------------------
+    // EXISTING CORE
+    // --------------------------------------------------
+    $kiosk_id = (int) $req->get_param('kiosk_id');
+    if ( ! $kiosk_id ) {
+        return new WP_Error('bad_request','Missing kiosk_id',[ 'status'=>400 ]);
+    }
+
+    $kiosk = meadow_kiosk_get_kiosk_by_kiosk_id($kiosk_id);
+    if ( ! $kiosk ) {
+        return new WP_Error('not_found','Kiosk not found',[ 'status'=>404 ]);
+    }
+
+    $now = time();
+
+    // Fetch kiosk segments only for debug/visibility now (NOT used for matching)
+    $kiosk_segments = wp_get_post_terms(
+        $kiosk->ID,
+        self::TAX_KIOSK_SEGMENT,
+        [ 'fields' => 'slugs' ]
+    );
+    if ( ! is_array($kiosk_segments) ) $kiosk_segments = [];
+
+    // Load ads
+    $house = $this->query_ads_for_playlist([
+        'billing_model' => 'free',
+        'now' => $now,
+    ]);
+
+    $paid = $this->query_ads_for_playlist([
+        'billing_model' => 'flat',
+        'now' => $now,
+    ]);
+
+    $out = [];
+
+    // --------------------------------------------------
+    // FREE ADS: only show if assigned to kiosk
+    // --------------------------------------------------
+    foreach ( $house as $p ) {
+
+        $assigned = $this->ad_assigned_to_kiosk((int)$p->ID, (int)$kiosk->ID);
+
+        if ( $resp_debug ) {
+            $resp_debug['gate'][(string)$p->ID] = $assigned ? 'free_included' : 'free_not_assigned';
+            $resp_debug['gate_detail'][(string)$p->ID] = [
+                'billing' => 'free',
+                'kiosk_post_id' => (int)$kiosk->ID,
+                'relation_id' => (int) self::RELATION_AD_TO_KIOSK_ID,
+                'assigned' => (bool)$assigned,
+                'kiosk_segments' => $kiosk_segments,
+            ];
+        }
+
+        if ( ! $assigned ) continue;
+
+        $item = $this->format_ad_for_playlist($p);
+        if ( $item ) $out[] = $item;
+    }
+
+    // --------------------------------------------------
+    // PAID ADS: subscription active + assigned + not blocked by kiosk
+    // --------------------------------------------------
+    foreach ( $paid as $p ) {
+
+        $adv_user_id = (int) get_post_meta($p->ID, '_meadow_advertiser_user_id', true);
+        if ( ! $adv_user_id ) {
+            if ( $resp_debug ) $resp_debug['gate'][(string)$p->ID] = 'paid_no_adv_user';
+            continue;
+        }
+
+        $sub_id = (int) get_post_meta($p->ID, '_meadow_subscription_id', true);
+        if ( ! $this->subscription_is_active_for_user($adv_user_id, $sub_id) ) {
+            if ( $resp_debug ) $resp_debug['gate'][(string)$p->ID] = 'paid_sub_not_active_or_owner_mismatch';
+            continue;
+        }
+
+        $assigned = $this->ad_assigned_to_kiosk((int)$p->ID, (int)$kiosk->ID);
+        if ( ! $assigned ) {
+            if ( $resp_debug ) $resp_debug['gate'][(string)$p->ID] = 'paid_not_assigned';
+            continue;
+        }
+
+        $allowed = $this->kiosk_allows_ad_by_segment_blocklist((int)$kiosk->ID, (int)$p->ID);
+        if ( ! $allowed ) {
+            if ( $resp_debug ) $resp_debug['gate'][(string)$p->ID] = 'paid_blocked_by_kiosk_segments';
+            continue;
+        }
+
+        if ( $resp_debug ) {
+            $resp_debug['gate'][(string)$p->ID] = 'paid_included';
+            $resp_debug['gate_detail'][(string)$p->ID] = [
+                'billing' => 'flat',
+                'kiosk_post_id' => (int)$kiosk->ID,
+                'relation_id' => (int) self::RELATION_AD_TO_KIOSK_ID,
+                'assigned' => (bool)$assigned,
+                'kiosk_segments' => $kiosk_segments,
+                'blocked_meta' => get_post_meta((int)$kiosk->ID, '_meadow_blocked_ad_segments', true),
+                'ad_segment_ids' => wp_get_post_terms((int)$p->ID, 'ad_segment', [ 'fields' => 'ids' ]),
+            ];
+        }
+
+        $item = $this->format_ad_for_playlist($p);
+        if ( $item ) $out[] = $item;
+    }
+
+    if ( count($out) > 1 ) shuffle($out);
+
+    $resp = [
+        'kiosk_id' => $kiosk_id,
+        'default_duration' => 10,
+        'ads' => $out,
+    ];
+
+    if ( $resp_debug ) {
+        $resp['__debug'] = $resp_debug;
+    }
+
+    return $resp;
+}
+
+
+
 
     /* ---------------------------------------------
      * Legacy Woo completion
@@ -1806,7 +1946,7 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return $t ? (int)$t : 0;
     }
 
-        private function format_ad_for_playlist( WP_Post $ad_post ) {
+    private function format_ad_for_playlist( WP_Post $ad_post ) {
     $type = (string) get_post_meta($ad_post->ID, '_meadow_creative_type', true);
 
     // Duration (keep existing typo key, but add a correct fallback too)
@@ -1862,6 +2002,7 @@ public function rest_vend_result( WP_REST_Request $req ) {
         'duration' => (int) $dur,
     ];
 }
+
 
     private function ad_matches_kiosk_segments( int $ad_post_id, array $kiosk_segments ): bool {
         if ( empty($kiosk_segments) ) return false;
@@ -2042,4 +2183,3 @@ public function rest_vend_result( WP_REST_Request $req ) {
         return true;
     }
 }
-
