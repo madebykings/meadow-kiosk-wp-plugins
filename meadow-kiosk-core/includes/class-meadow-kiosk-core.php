@@ -1382,75 +1382,6 @@ public function rest_vend_result( WP_REST_Request $req ) {
 public function rest_kiosk_ads( WP_REST_Request $req ) {
     $this->nocache();
 
-    // --------------------------------------------------
-    // DEBUG (token-gated; works even if REST cookies aren't auth'd)
-    // --------------------------------------------------
-    $debug     = (int) $req->get_param('debug');
-    $debug_key = (string) $req->get_param('debug_key');
-
-    $resp_debug = null;
-
-    if ( $debug === 1 && hash_equals('abcd1234', $debug_key) ) {
-
-        $resp_debug = [
-            'now_utc' => gmdate('c'),
-            'route'   => $req->get_route(),
-            'is_admin' => current_user_can('manage_options') ? 1 : 0,
-            'wcs_users_subs_available' => function_exists('wcs_get_users_subscriptions'),
-            'wcs_get_subscription_available' => function_exists('wcs_get_subscription'),
-            'ads_checked' => [],
-            'gate' => [],          // per-ad gate result
-            'gate_detail' => [],   // per-ad detail
-        ];
-
-        // Inspect all ACTIVE ads directly (ground truth)
-        $q = new WP_Query([
-            'post_type'      => self::AD_POST_TYPE, // 'ad'
-            'post_status'    => 'publish',
-            'posts_per_page' => 100,
-            'meta_query'     => [
-                [ 'key' => '_meadow_status', 'value' => 'active', 'compare' => '=' ],
-            ],
-            'no_found_rows'  => true,
-            'fields'         => 'ids',
-        ]);
-
-        foreach ( $q->posts as $ad_id ) {
-            $billing = (string) get_post_meta($ad_id, '_meadow_billing_model', true);
-            $adv_uid = (int) get_post_meta($ad_id, '_meadow_advertiser_user_id', true);
-            $sub_id  = (int) get_post_meta($ad_id, '_meadow_subscription_id', true);
-
-            $sub_exists = false;
-            $sub_uid = 0;
-            $sub_status = '';
-            $sub_ok = false;
-
-            if ( $billing === 'flat' && function_exists('wcs_get_subscription') && $sub_id ) {
-                $sub = wcs_get_subscription($sub_id);
-                if ( $sub ) {
-                    $sub_exists = true;
-                    $sub_uid = (int) $sub->get_user_id();
-                    $sub_status = (string) $sub->get_status();
-                    $sub_ok = ( $sub_uid === $adv_uid ) && $sub->has_status('active');
-                }
-            }
-
-            $resp_debug['ads_checked'][] = [
-                'ad_id' => (int) $ad_id,
-                'billing' => $billing,
-                'adv_user_id' => $adv_uid,
-                'sub_id' => $sub_id,
-                'sub_exists' => $sub_exists,
-                'sub_user_id' => $sub_uid,
-                'sub_status' => $sub_status,
-                'sub_ok_strict' => $sub_ok,
-            ];
-        }
-    }
-
-    // --------------------------------------------------
-    // EXISTING CORE
-    // --------------------------------------------------
     $kiosk_id = (int) $req->get_param('kiosk_id');
     if ( ! $kiosk_id ) {
         return new WP_Error('bad_request','Missing kiosk_id',[ 'status'=>400 ]);
@@ -1463,20 +1394,23 @@ public function rest_kiosk_ads( WP_REST_Request $req ) {
 
     $now = time();
 
-    // Fetch kiosk segments only for debug/visibility now (NOT used for matching)
+    // Kiosk segments (ONLY used as a blocklist)
     $kiosk_segments = wp_get_post_terms(
         $kiosk->ID,
         self::TAX_KIOSK_SEGMENT,
         [ 'fields' => 'slugs' ]
     );
-    if ( ! is_array($kiosk_segments) ) $kiosk_segments = [];
+    if ( ! is_array($kiosk_segments) ) {
+        $kiosk_segments = [];
+    }
 
-    // Load ads
+    // Free (house) ads
     $house = $this->query_ads_for_playlist([
         'billing_model' => 'free',
         'now' => $now,
     ]);
 
+    // Paid ads
     $paid = $this->query_ads_for_playlist([
         'billing_model' => 'flat',
         'now' => $now,
@@ -1484,89 +1418,59 @@ public function rest_kiosk_ads( WP_REST_Request $req ) {
 
     $out = [];
 
-    // --------------------------------------------------
-    // FREE ADS: only show if assigned to kiosk
-    // --------------------------------------------------
+    // ----------------------------------
+    // FREE ADS: must be assigned
+    // ----------------------------------
     foreach ( $house as $p ) {
 
-        $assigned = $this->ad_assigned_to_kiosk((int)$p->ID, (int)$kiosk->ID);
-
-        if ( $resp_debug ) {
-            $resp_debug['gate'][(string)$p->ID] = $assigned ? 'free_included' : 'free_not_assigned';
-            $resp_debug['gate_detail'][(string)$p->ID] = [
-                'billing' => 'free',
-                'kiosk_post_id' => (int)$kiosk->ID,
-                'relation_id' => (int) self::RELATION_AD_TO_KIOSK_ID,
-                'assigned' => (bool)$assigned,
-                'kiosk_segments' => $kiosk_segments,
-            ];
+        if ( ! $this->ad_assigned_to_kiosk( (int) $p->ID, (int) $kiosk->ID ) ) {
+            continue;
         }
 
-        if ( ! $assigned ) continue;
-
         $item = $this->format_ad_for_playlist($p);
-        if ( $item ) $out[] = $item;
+        if ( $item ) {
+            $out[] = $item;
+        }
     }
 
-    // --------------------------------------------------
-    // PAID ADS: subscription active + assigned + not blocked by kiosk
-    // --------------------------------------------------
+    // ----------------------------------
+    // PAID ADS: subscription + assignment + blocklist
+    // ----------------------------------
     foreach ( $paid as $p ) {
 
         $adv_user_id = (int) get_post_meta($p->ID, '_meadow_advertiser_user_id', true);
         if ( ! $adv_user_id ) {
-            if ( $resp_debug ) $resp_debug['gate'][(string)$p->ID] = 'paid_no_adv_user';
             continue;
         }
 
         $sub_id = (int) get_post_meta($p->ID, '_meadow_subscription_id', true);
         if ( ! $this->subscription_is_active_for_user($adv_user_id, $sub_id) ) {
-            if ( $resp_debug ) $resp_debug['gate'][(string)$p->ID] = 'paid_sub_not_active_or_owner_mismatch';
             continue;
         }
 
-        $assigned = $this->ad_assigned_to_kiosk((int)$p->ID, (int)$kiosk->ID);
-        if ( ! $assigned ) {
-            if ( $resp_debug ) $resp_debug['gate'][(string)$p->ID] = 'paid_not_assigned';
+        if ( ! $this->ad_assigned_to_kiosk( (int) $p->ID, (int) $kiosk->ID ) ) {
             continue;
         }
 
-        $allowed = $this->kiosk_allows_ad_by_segment_blocklist((int)$kiosk->ID, (int)$p->ID);
-        if ( ! $allowed ) {
-            if ( $resp_debug ) $resp_debug['gate'][(string)$p->ID] = 'paid_blocked_by_kiosk_segments';
+        if ( ! $this->kiosk_allows_ad_by_segment_blocklist( (int) $kiosk->ID, (int) $p->ID ) ) {
             continue;
-        }
-
-        if ( $resp_debug ) {
-            $resp_debug['gate'][(string)$p->ID] = 'paid_included';
-            $resp_debug['gate_detail'][(string)$p->ID] = [
-                'billing' => 'flat',
-                'kiosk_post_id' => (int)$kiosk->ID,
-                'relation_id' => (int) self::RELATION_AD_TO_KIOSK_ID,
-                'assigned' => (bool)$assigned,
-                'kiosk_segments' => $kiosk_segments,
-                'blocked_meta' => get_post_meta((int)$kiosk->ID, '_meadow_blocked_ad_segments', true),
-                'ad_segment_ids' => wp_get_post_terms((int)$p->ID, 'ad_segment', [ 'fields' => 'ids' ]),
-            ];
         }
 
         $item = $this->format_ad_for_playlist($p);
-        if ( $item ) $out[] = $item;
+        if ( $item ) {
+            $out[] = $item;
+        }
     }
 
-    if ( count($out) > 1 ) shuffle($out);
+    if ( count($out) > 1 ) {
+        shuffle($out);
+    }
 
-    $resp = [
+    return [
         'kiosk_id' => $kiosk_id,
         'default_duration' => 10,
         'ads' => $out,
     ];
-
-    if ( $resp_debug ) {
-        $resp['__debug'] = $resp_debug;
-    }
-
-    return $resp;
 }
 
 
@@ -1846,17 +1750,17 @@ public function rest_kiosk_ads( WP_REST_Request $req ) {
 private function ad_assigned_to_kiosk( int $ad_id, int $kiosk_post_id ): bool {
     global $wpdb;
 
-    // JetEngine creates a dedicated table per relation when "Register separate DB table" is ON
+    // JetEngine relation with "Register separate DB table" enabled
+    // Relation ID = Ads ↔ Kiosks
     $table = $wpdb->prefix . 'jet_rel_' . self::RELATION_AD_TO_KIOSK_ID;
 
-    // Parent = Ad, Child = Kiosk
     $exists = $wpdb->get_var(
         $wpdb->prepare(
             "
             SELECT 1
             FROM {$table}
-            WHERE parent_object_id = %d
-              AND child_object_id  = %d
+            WHERE parent_object_id = %d   -- Ad
+              AND child_object_id  = %d   -- Kiosk
             LIMIT 1
             ",
             $ad_id,
@@ -1866,7 +1770,6 @@ private function ad_assigned_to_kiosk( int $ad_id, int $kiosk_post_id ): bool {
 
     return (bool) $exists;
 }
-
 
 
 /**
