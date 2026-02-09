@@ -102,7 +102,7 @@ function meadow_lametric_today( WP_REST_Request $req ) {
     $payload = [
     'frames' => [
         [
-            'icon' => 'i2989',
+            'icon' => 'i39850',
             'text' => '£' . number_format($total, 2) . ' (' . $count . ')'
         ]
     ]
