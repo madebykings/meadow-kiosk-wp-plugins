@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Meadow × LaMetric (Today)
  * Description: LaMetric HTTP Poll endpoint for TODAY’s Meadow kiosk sales (Europe/London, HPOS-safe).
- * Version: 2.2.0
+ * Version: 2.3.0
  */
 
 if ( ! defined('ABSPATH') ) exit;
@@ -44,6 +44,27 @@ function meadow_lametric_sale_datetime( WC_Order $order ): ?DateTimeImmutable {
         ->setTimezone($tz);
 }
 
+/**
+ * Debounce LaMetric notifications:
+ * - Only allow a "change" when the COUNT increases (new order).
+ * - Then lock for 60s so repeated polls don't re-notify.
+ * Returns true if we should emit the NEW payload.
+ */
+function meadow_lametric_should_emit( int $count ): bool {
+    $key  = 'meadow_lametric_last_count';
+    $prev = get_transient($key);
+
+    $prev_i = ($prev === false) ? null : (int)$prev;
+
+    // First run or count changed
+    if ($prev_i === null || $prev_i !== $count) {
+        set_transient($key, (int)$count, 60);
+        return true;
+    }
+
+    return false;
+}
+
 function meadow_lametric_today( WP_REST_Request $req ) {
 
     if ( ! function_exists('wc_get_orders') ) {
@@ -69,7 +90,7 @@ function meadow_lametric_today( WP_REST_Request $req ) {
 
     /**
      * Pull recent completed orders only, then do exact filtering in PHP.
-     * This comfortably handles 400+ kiosk orders/day.
+     * 400/day is fine. We scan a small window (created in last 2 days) to keep it lean.
      */
     $orders = wc_get_orders([
         'status'       => ['completed'],
@@ -100,16 +121,30 @@ function meadow_lametric_today( WP_REST_Request $req ) {
     }
 
     $payload = [
-    'frames' => [
-        [
-            'icon' => 'i39850',
-            'text' => '£' . number_format($total, 2) . ' (' . $count . ')'
+        'frames' => [
+            [
+                'icon' => 'i39850',
+                'text' => '£' . number_format($total, 2) . ' (' . $count . ')'
+            ]
         ]
-    ]
-];
+    ];
 
-    // Short cache for LaMetric polling
-    set_transient($cache_key, $payload, 10);
+    /**
+     * If LaMetric polls repeatedly, we don't want repeated notifications.
+     * We only "emit" a changed payload once per new count (then lock for 60s).
+     */
+    $existing = get_transient($cache_key);
 
+    if ( meadow_lametric_should_emit($count) ) {
+        // Cache for 30s (suggest setting LaMetric poll to 30s too)
+        set_transient($cache_key, $payload, 30);
+        return $payload;
+    }
+
+    // No change -> keep returning the cached payload (prevents notify spam)
+    if ( $existing !== false ) return $existing;
+
+    // Safety fallback if no cached value yet
+    set_transient($cache_key, $payload, 30);
     return $payload;
 }
